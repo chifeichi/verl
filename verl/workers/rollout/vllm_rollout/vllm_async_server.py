@@ -17,7 +17,6 @@ import inspect
 import json
 import logging
 import os
-import time
 import uuid
 from pprint import pprint
 from typing import Any, Callable, Optional
@@ -92,6 +91,10 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
+def pd_stall_print(message: str, *args) -> None:
+    print(message % args, flush=True)
+
+
 class vLLMHttpServer:
     """vLLM http server in single node, this is equivalent to launch server with command line:
     ```
@@ -142,12 +145,8 @@ class vLLMHttpServer:
         self._pd_peer_idx: int = 0
         self._pd_layerwise_meta_futures: dict[str, asyncio.Future] = {}
         self._pd_peer_inflight: list[int] = []
-        self._pd_perf_request_count = 0
-        try:
-            self._pd_perf_log_every = max(0, int(os.environ.get("VERL_PD_PERF_LOG_EVERY", "0")))
-        except ValueError:
-            self._pd_perf_log_every = 0
-            logger.warning("Ignore invalid VERL_PD_PERF_LOG_EVERY")
+        self._pd_stall_stages: dict[str, str] = {}
+        self._pd_stall_heartbeat_task: Optional[asyncio.Task] = None
 
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
         os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
@@ -270,13 +269,28 @@ class vLLMHttpServer:
                 else self._server_address
             )
             self._pd_metaserver_base_url = f"http://{host}:{self._server_port}/verl/pd/metaserver"
-        
+
         self._pd_prefill_side_channel_port = prefill_side_channel_port
         self._pd_prefill_engine_id = prefill_engine_id
         self._pd_decode_peers = list(decode_peers)
         self._pd_peer_inflight = [0] * len(self._pd_decode_peers)
 
+    async def _pd_stall_heartbeat(self) -> None:
+        while True:
+            pd_stall_print(
+                "[PD_STALL] role=verl_%s stage=heartbeat pid=%s replica_rank=%s "
+                "node_rank=%s pending=%s",
+                self._disaggregation_role,
+                os.getpid(),
+                self.replica_rank,
+                self.node_rank,
+                dict(self._pd_stall_stages),
+            )
+            await asyncio.sleep(10)
+
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
+        if self._pd_stall_heartbeat_task is None:
+            self._pd_stall_heartbeat_task = asyncio.create_task(self._pd_stall_heartbeat())
         if self.node_rank != 0:
             assert master_address and master_port and dp_rpc_port, (
                 "non-master node should provide master_address, master_port and dp_rpc_port"
@@ -342,10 +356,7 @@ class vLLMHttpServer:
             "logprobs_mode": self.config.logprobs_mode,
             "enforce_eager": self.config.enforce_eager,
             "gpu_memory_utilization": self.config.gpu_memory_utilization,
-            "disable_log_stats": (
-                self.config.disable_log_stats
-                and not (self._disaggregation_role != "null" and self._pd_perf_log_every > 0)
-            ),
+            "disable_log_stats": self.config.disable_log_stats,
             "tensor_parallel_size": self.config.tensor_model_parallel_size,
             "seed": self.replica_rank + self.config.seed,
             "override_generation_config": json.dumps(override_generation_config),
@@ -524,11 +535,24 @@ class vLLMHttpServer:
         ):
             @app.post("/verl/pd/metaserver/{transfer_id}")
             async def _receive_layerwise_metadata(transfer_id: str, request: Request):
+                pd_stall_print(
+                    "[PD_STALL] role=verl_prefill stage=metaserver_enter transfer_id=%s",
+                    transfer_id,
+                )
                 future = self._pd_layerwise_meta_futures.get(transfer_id)
                 if future is None:
+                    pd_stall_print(
+                        "[PD_STALL] role=verl_prefill stage=metaserver_rejected "
+                        "transfer_id=%s reason=unknown_or_expired",
+                        transfer_id,
+                    )
                     return {"accepted": False, "reason": "unknown or expired transfer_id"}
                 if not future.done():
                     future.set_result(await request.json())
+                pd_stall_print(
+                    "[PD_STALL] role=verl_prefill stage=metaserver_done transfer_id=%s",
+                    transfer_id,
+                )
                 return {"accepted": True}
 
         init_app_sig = inspect.signature(init_app_state)
@@ -585,6 +609,12 @@ class vLLMHttpServer:
             kv_transfer_params: vLLM KV-transfer payload for PD requests.
         """
         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
+            pd_stall_print(
+                "[PD_STALL] role=verl_prefill stage=dispatch_enter "
+                "request_id=%s prompt_tokens=%s",
+                request_id,
+                len(prompt_ids),
+            )
             return await self._pd_dispatch(
                 prompt_ids,
                 sampling_params,
@@ -671,8 +701,16 @@ class vLLMHttpServer:
                     lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
                 )
 
-        engine_start = time.perf_counter()
         with RLInsightLogger.trace_state("vllm_generate", state_lane_id=f"replica_{self.replica_rank}"):
+            self._pd_stall_stages[request_id] = "engine_generate"
+            pd_stall_print(
+                "[PD_STALL] role=verl_%s stage=engine_generate_enter "
+                "request_id=%s prompt_tokens=%s has_kv_params=%s",
+                self._disaggregation_role,
+                request_id,
+                len(prompt_ids),
+                kv_transfer_params is not None,
+            )
             generator = self.engine.generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
@@ -683,31 +721,26 @@ class vLLMHttpServer:
 
             # Get final response
             final_res: Optional[RequestOutput] = None
+            first_output = True
             async for output in generator:
+                if first_output:
+                    first_output = False
+                    self._pd_stall_stages[request_id] = "engine_first_output"
+                    pd_stall_print(
+                        "[PD_STALL] role=verl_%s stage=engine_first_output request_id=%s",
+                        self._disaggregation_role,
+                        request_id,
+                    )
                 final_res = output
             assert final_res is not None
+            pd_stall_print(
+                "[PD_STALL] role=verl_%s stage=engine_generate_done request_id=%s",
+                self._disaggregation_role,
+                request_id,
+            )
+            self._pd_stall_stages.pop(request_id, None)
 
-        engine_end = time.perf_counter()
         extra_fields = {"global_steps": self.global_steps}
-        if self._disaggregation_role != "null":
-            engine_perf: dict[str, Any] = {
-                "role": self._disaggregation_role,
-                "engine_total_ms": round((engine_end - engine_start) * 1000, 3),
-                "cache_tokens": getattr(final_res, "num_cached_tokens", None)
-            }
-            metrics = getattr(final_res, "metrics", None)
-            if metrics is not None:
-                queued_ts = float(getattr(metrics, "queued_ts", 0.0) or 0.0)
-                schedule_ts = float(getattr(metrics, "schedule_ts", 0.0) or 0.0)
-                first_token_ts = float(getattr(metrics, "first_token_ts", 0.0) or 0.0)
-                last_token_ts = float(getattr(metrics, "last_token_ts", 0.0) or 0.0)
-                if queued_ts > 0 and schedule_ts >= queued_ts:
-                    engine_perf["queue_ms"] = round((schedule_ts - queued_ts) * 1000, 3)
-                if queued_ts > 0 and first_token_ts >= queued_ts:
-                    engine_perf["ttft_ms"] = round((first_token_ts - queued_ts) * 1000, 3)
-                if first_token_ts > 0 and last_token_ts >= first_token_ts:
-                    engine_perf["generation_span_ms"] = round((last_token_ts - first_token_ts) * 1000, 3)
-            extra_fields["pd_engine_perf"] = engine_perf
         # Handle abort case: when the request is aborted by pause_generation(abort),
         # outputs may be empty. Return empty results with stop_reason="aborted"
         # instead of crashing with "IndexError: list index out of range".
@@ -805,7 +838,6 @@ class vLLMHttpServer:
             if not isinstance(peer_inflight, list) or len(peer_inflight) != len(self._pd_decode_peers):
                 peer_inflight = [0] * len(self._pd_decode_peers)
                 self._pd_peer_inflight = peer_inflight
-            inflight_before = list(peer_inflight)
             peer_inflight[decode_index] += 1
 
             transfer_id = uuid.uuid4().hex
@@ -816,6 +848,14 @@ class vLLMHttpServer:
                 "do_remote_prefill": True,
                 "metaserver": f"{self._pd_metaserver_base_url}/{transfer_id}",
             }
+            self._pd_stall_stages[request_id] = "decode_rpc_submit"
+            pd_stall_print(
+                "[PD_STALL] role=verl_prefill stage=decode_rpc_submit "
+                "request_id=%s transfer_id=%s decode_index=%s",
+                request_id,
+                transfer_id,
+                decode_index,
+            )
             decode_result = decode_peer.generate.remote(
                 prompt_ids,
                 dict(sampling_params),
@@ -828,24 +868,34 @@ class vLLMHttpServer:
                 kv_transfer_params=decode_kv_params,
             )
             timeout_s = float(os.environ.get("VERL_PD_METASERVER_TIMEOUT_S", "300"))
-            dispatch_start = time.perf_counter()
-            metadata_received = None
-            prefill_finished = None
-            decode_finished = None
-            prefill_out = None
-            result = None
-            error_type = None
-            self._pd_perf_request_count = getattr(self, "_pd_perf_request_count", 0) + 1
-            log_every = getattr(self, "_pd_perf_log_every", 0)
-            should_log = log_every > 0 and self._pd_perf_request_count % log_every == 0
             try:
+                self._pd_stall_stages[request_id] = "metadata_wait"
+                pd_stall_print(
+                    "[PD_STALL] role=verl_prefill stage=metadata_wait_enter "
+                    "request_id=%s transfer_id=%s timeout_s=%s",
+                    request_id,
+                    transfer_id,
+                    timeout_s,
+                )
                 prefill_kv_params = await asyncio.wait_for(metadata_future, timeout=timeout_s)
-                metadata_received = time.perf_counter()
+                pd_stall_print(
+                    "[PD_STALL] role=verl_prefill stage=metadata_wait_done "
+                    "request_id=%s transfer_id=%s",
+                    request_id,
+                    transfer_id,
+                )
                 prefill_sp = dict(sampling_params)
                 prefill_sp.pop("max_tokens", None)
                 prefill_sp.pop("max_new_tokens", None)
                 prefill_sp["max_tokens"] = 1
-                prefill_out = await self.generate(
+                self._pd_stall_stages[request_id] = "prefill_generate"
+                pd_stall_print(
+                    "[PD_STALL] role=verl_prefill stage=prefill_generate_enter "
+                    "request_id=%s transfer_id=%s",
+                    request_id,
+                    transfer_id,
+                )
+                await self.generate(
                     prompt_ids,
                     prefill_sp,
                     request_id,
@@ -856,12 +906,28 @@ class vLLMHttpServer:
                     priority=priority,
                     kv_transfer_params=prefill_kv_params,
                 )
-                prefill_finished = time.perf_counter()
+                pd_stall_print(
+                    "[PD_STALL] role=verl_prefill stage=prefill_generate_done "
+                    "request_id=%s transfer_id=%s",
+                    request_id,
+                    transfer_id,
+                )
+                self._pd_stall_stages[request_id] = "decode_result_wait"
+                pd_stall_print(
+                    "[PD_STALL] role=verl_prefill stage=decode_result_wait_enter "
+                    "request_id=%s transfer_id=%s",
+                    request_id,
+                    transfer_id,
+                )
                 result = await decode_result
-                decode_finished = time.perf_counter()
+                pd_stall_print(
+                    "[PD_STALL] role=verl_prefill stage=decode_result_wait_done "
+                    "request_id=%s transfer_id=%s",
+                    request_id,
+                    transfer_id,
+                )
                 return result
-            except BaseException as exc:
-                error_type = type(exc).__name__
+            except BaseException:
                 try:
                     await decode_peer.abort_request.remote(request_id, reset_prefix_cache=False)
                 except Exception:
@@ -873,55 +939,7 @@ class vLLMHttpServer:
             finally:
                 self._pd_layerwise_meta_futures.pop(transfer_id, None)
                 peer_inflight[decode_index] = max(0, peer_inflight[decode_index] - 1)
-                if log_every > 0 and (should_log or error_type is not None):
-                    finished = decode_finished or time.perf_counter()
-                    max_output_tokens = sampling_params.get(
-                        "max_tokens", sampling_params.get("max_new_tokens", self.config.response_length)
-                    )
-                    perf = {
-                        "request_id": request_id,
-                        "decode_id": decode_index,
-                        "prompt_tokens": len(prompt_ids),
-                        "max_output_tokens": max_output_tokens,
-                        "actual_output_tokens": len(result.token_ids) if result is not None else None,
-                        "inflight_before": inflight_before,
-                        "inflight_after_select": inflight_before[decode_index] + 1,
-                        "dispatch_start_ns": int(dispatch_start * 1_000_000_000),
-                        "metadata_received_ns": (
-                            int(metadata_received * 1_000_000_000) if metadata_received is not None else None
-                        ),
-                        "prefill_finished_ns": (
-                            int(prefill_finished * 1_000_000_000) if prefill_finished is not None else None
-                        ),
-                        "decode_finished_ns": (
-                            int(decode_finished * 1_000_000_000) if decode_finished is not None else None
-                        ),
-                        "metadata_wait_ms": (
-                            round((metadata_received - dispatch_start) * 1000, 3)
-                            if metadata_received is not None
-                            else None
-                        ),
-                        "prefill_leg_ms": (
-                            round((prefill_finished - metadata_received) * 1000, 3)
-                            if metadata_received is not None and prefill_finished is not None
-                            else None
-                        ),
-                        "decode_wait_after_prefill_ms": (
-                            round((decode_finished - prefill_finished) * 1000, 3)
-                            if prefill_finished is not None and decode_finished is not None
-                            else None
-                        ),
-                        "pd_total_ms": round((finished - dispatch_start) * 1000, 3),
-                        "prefill_engine": (
-                            prefill_out.extra_fields.get("pd_engine_perf") if prefill_out is not None else None
-                        ),
-                        "decode_engine": (
-                            result.extra_fields.get("pd_engine_perf") if result is not None else None
-                        ),
-                        "status": "error" if error_type is not None else "completed",
-                        "error_type": error_type,
-                    }
-                    logger.info("[VERL_PD_PERF] %s", json.dumps(perf, separators=(",", ":"), sort_keys=True))
+                self._pd_stall_stages.pop(request_id, None)
 
         # Prefill only materializes KV; discard its single generated token.
         prefill_sp = dict(sampling_params)
@@ -1510,4 +1528,3 @@ class vLLMReplica(RolloutReplica):
     def _get_server_name_prefix(self) -> str:
         """Return the Ray actor name prefix (e.g. 'vllm_')."""
         return "vllm_"
-
