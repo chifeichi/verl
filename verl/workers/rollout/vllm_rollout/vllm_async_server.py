@@ -13,10 +13,12 @@
 # limitations under the License.
 import argparse
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
 import os
+import time
 import uuid
 from collections.abc import Sequence
 from pprint import pprint
@@ -142,6 +144,13 @@ class vLLMHttpServer:
         self._pd_decode_selector: Optional[DecodePeerSelector] = None
         self._pd_metaserver_base_url: Optional[str] = None
         self._pd_layerwise_meta_futures: dict[str, asyncio.Future] = {}
+        self._pd_routing_request_count = 0
+        self._pd_routing_selected_counts: list[int] = []
+        try:
+            self._pd_routing_log_every = max(0, int(os.environ.get("VERL_PD_ROUTING_LOG_EVERY", "0")))
+        except ValueError:
+            self._pd_routing_log_every = 0
+            logger.warning("Ignoring invalid VERL_PD_ROUTING_LOG_EVERY; routing trace is disabled")
 
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
         os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
@@ -264,6 +273,7 @@ class vLLMHttpServer:
             policy_config=self.config.disaggregation.decode_policy,
             peer_ids=decode_peer_ids,
         )
+        self._pd_routing_selected_counts = [0] * len(decode_peers)
         connector = (self._disaggregation_kv_transfer_config or {}).get("kv_connector", "")
         if connector == "MooncakeLayerwiseConnector":
             if self._server_port is None:
@@ -725,6 +735,9 @@ class vLLMHttpServer:
         response_kv_transfer_params = getattr(final_res, "kv_transfer_params", None)
         if response_kv_transfer_params is not None:
             extra_fields["kv_transfer_params"] = response_kv_transfer_params
+        num_cached_tokens = getattr(final_res, "num_cached_tokens", None)
+        if num_cached_tokens is not None:
+            extra_fields["num_cached_tokens"] = num_cached_tokens
 
         # Re-key backend spec-decoding stats to the rollout-common names.
         if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
@@ -768,11 +781,48 @@ class vLLMHttpServer:
         routing_key: Optional[str] = None,
     ) -> TokenOutput:
         """Reserve a decode peer, run prefill locally, then dispatch decode."""
-        decode_peer_index, decode_peer = self._select_decode_peer(routing_key or request_id, prompt_ids)
+        effective_routing_key = routing_key or request_id
+        decode_peer_index, decode_peer = self._select_decode_peer(effective_routing_key, prompt_ids)
+        assert self._pd_decode_selector is not None
+        self._pd_routing_request_count += 1
+        request_seq = self._pd_routing_request_count
+        if len(self._pd_routing_selected_counts) != len(self._pd_decode_peers):
+            self._pd_routing_selected_counts = [0] * len(self._pd_decode_peers)
+        self._pd_routing_selected_counts[decode_peer_index] += 1
+        should_log = self._pd_routing_log_every > 0 and request_seq % self._pd_routing_log_every == 0
+        started_at = time.perf_counter() if should_log else 0.0
+        result: Optional[TokenOutput] = None
+        error_type: Optional[str] = None
+        if should_log:
+            pending_after_select = list(self._pd_decode_selector.pending_requests)
+            pending_before_select = list(pending_after_select)
+            pending_before_select[decode_peer_index] -= 1
+            routing_key_hash = hashlib.sha256(effective_routing_key.encode()).hexdigest()[:16]
+            logger.info(
+                "[VERL_PD_ROUTING] %s",
+                json.dumps(
+                    {
+                        "event": "select",
+                        "policy": self._pd_decode_selector.config.type,
+                        "replica_rank": self.replica_rank,
+                        "request_seq": request_seq,
+                        "request_id": request_id,
+                        "routing_key_hash": routing_key_hash,
+                        "decode_index": decode_peer_index,
+                        "decode_peer": self._pd_decode_selector.peer_ids[decode_peer_index],
+                        "prompt_tokens": len(prompt_ids),
+                        "pending_before": pending_before_select,
+                        "pending_after": pending_after_select,
+                        "selected_counts": list(self._pd_routing_selected_counts),
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            )
         try:
             connector = (self._disaggregation_kv_transfer_config or {}).get("kv_connector", "")
             if connector == "MooncakeLayerwiseConnector":
-                return await self._pd_dispatch_ascend_layerwise(
+                result = await self._pd_dispatch_ascend_layerwise(
                     prompt_ids=prompt_ids,
                     sampling_params=sampling_params,
                     request_id=request_id,
@@ -783,6 +833,7 @@ class vLLMHttpServer:
                     mm_processor_kwargs=mm_processor_kwargs,
                     priority=priority,
                 )
+                return result
             is_mooncake = connector == "MooncakeConnector"
 
             # Prefill only materializes KV; discard its single generated token.
@@ -823,7 +874,7 @@ class vLLMHttpServer:
                 if decode_kv_params is None:
                     raise RuntimeError(f"PD prefill leg returned no kv_transfer_params (request_id={request_id})")
 
-            return await decode_peer.generate.remote(
+            result = await decode_peer.generate.remote(
                 prompt_ids,
                 dict(sampling_params),
                 f"{request_id}_D",
@@ -834,9 +885,37 @@ class vLLMHttpServer:
                 priority=priority,
                 kv_transfer_params=decode_kv_params,
             )
+            return result
+        except BaseException as exc:
+            error_type = type(exc).__name__
+            raise
         finally:
-            assert self._pd_decode_selector is not None
             self._pd_decode_selector.release(decode_peer_index)
+            if should_log:
+                logger.info(
+                    "[VERL_PD_ROUTING] %s",
+                    json.dumps(
+                        {
+                            "event": "complete",
+                            "policy": self._pd_decode_selector.config.type,
+                            "replica_rank": self.replica_rank,
+                            "request_seq": request_seq,
+                            "request_id": request_id,
+                            "decode_index": decode_peer_index,
+                            "status": "error" if error_type is not None else "completed",
+                            "error_type": error_type,
+                            "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 3),
+                            "output_tokens": len(result.token_ids) if result is not None else None,
+                            "decode_cached_tokens": (
+                                result.extra_fields.get("num_cached_tokens") if result is not None else None
+                            ),
+                            "pending_after_release": list(self._pd_decode_selector.pending_requests),
+                            "selected_counts": list(self._pd_routing_selected_counts),
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                )
 
     async def _pd_dispatch_ascend_layerwise(
         self,

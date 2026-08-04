@@ -498,6 +498,10 @@ class _DispatchStub:
         self._pd_prefill_side_channel_port = 5559
         self._pd_metaserver_base_url = "http://127.0.0.1:8000/verl/pd/metaserver"
         self._pd_layerwise_meta_futures = {}
+        self._pd_routing_request_count = 0
+        self._pd_routing_selected_counts = []
+        self._pd_routing_log_every = 0
+        self.replica_rank = 0
 
     def _select_decode_peer(self, routing_key, prompt_ids):
         # Borrow the real implementation to keep the stub aligned with
