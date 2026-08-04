@@ -31,7 +31,8 @@ from unittest.mock import patch
 
 import pytest
 
-from verl.workers.config import DisaggregationConfig, RolloutConfig
+from verl.workers.config import DisaggregationConfig, RolloutConfig, RoutingPolicyConfig
+from verl.workers.rollout.vllm_rollout.pd_routing import DecodePeerSelector
 
 # ---------------------------------------------------------------------------
 # DisaggregationConfig validation
@@ -52,6 +53,29 @@ def test_disaggregation_enabled_nixl_accepted():
     cfg = DisaggregationConfig(enabled=True, transfer_backend="nixl")
     assert cfg.enabled is True
     assert cfg.transfer_backend == "nixl"
+
+
+def test_disaggregation_decode_policy_uses_vllm_router_defaults():
+    cfg = DisaggregationConfig(enabled=True)
+    assert cfg.decode_policy.type == "round_robin"
+    assert cfg.decode_policy.load_check_interval_secs == 5
+    assert cfg.decode_policy.virtual_nodes == 160
+    assert cfg.decode_policy.cache_threshold == 0.3
+    assert cfg.decode_policy.balance_abs_threshold == 64
+    assert cfg.decode_policy.balance_rel_threshold == 1.5
+    assert cfg.decode_policy.eviction_interval_secs == 120
+    assert cfg.decode_policy.max_tree_size == 2**26
+
+    for policy in ("random", "power_of_two", "consistent_hash", "rendezvous_hash", "cache_aware"):
+        cfg = DisaggregationConfig(enabled=True, decode_policy=RoutingPolicyConfig(type=policy))
+        assert cfg.decode_policy.type == policy
+
+    with pytest.raises(ValueError, match="policy type"):
+        RoutingPolicyConfig(type="least_active_tokens")
+    with pytest.raises(ValueError, match="cache_threshold"):
+        RoutingPolicyConfig(type="cache_aware", cache_threshold=1.1)
+    with pytest.raises(ValueError, match="virtual_nodes"):
+        RoutingPolicyConfig(type="consistent_hash", virtual_nodes=0)
 
 
 @pytest.mark.parametrize("backend", ["nixl", "mooncake", "ascend", "mori", "fake"])
@@ -137,10 +161,16 @@ def test_rollout_config_accepts_dict_disaggregation():
     """Hydra/OmegaConf hands the field as a plain dict; post_init must coerce."""
     cfg = RolloutConfig(
         name="vllm",
-        disaggregation={"enabled": True, "decode_replicas": 3},
+        disaggregation={
+            "enabled": True,
+            "decode_replicas": 3,
+            "decode_policy": {"type": "power_of_two"},
+        },
     )
     assert isinstance(cfg.disaggregation, DisaggregationConfig)
     assert cfg.disaggregation.decode_replicas == 3
+    assert isinstance(cfg.disaggregation.decode_policy, RoutingPolicyConfig)
+    assert cfg.disaggregation.decode_policy.type == "power_of_two"
 
 
 def test_rollout_config_accepts_dictconfig_disaggregation():
@@ -417,10 +447,11 @@ def test_pd_replica_init_requires_disaggregation_enabled(patched_replica_cls):
 class _DispatchStub:
     """Minimal vLLMHttpServer-like instance for unbound-method tests."""
 
-    def __init__(self, decode_peers, role="prefill", connector="NixlConnector"):
+    def __init__(self, decode_peers, role="prefill", connector="NixlConnector", policy="round_robin"):
         self._disaggregation_role = role
         self._pd_decode_peers = list(decode_peers)
-        self._pd_peer_idx = 0
+        peer_ids = [f"http://decode-{index}:8000" for index in range(len(self._pd_decode_peers))]
+        self._pd_decode_selector = DecodePeerSelector(RoutingPolicyConfig(type=policy), peer_ids)
         # Used by _pd_dispatch to branch between NIXL (read kv_transfer_params
         # back from prefill) and Mooncake (construct it locally from prefill
         # engine_id + bootstrap addr).
@@ -429,13 +460,13 @@ class _DispatchStub:
         self._pd_prefill_side_channel_host = "127.0.0.1"
         self._pd_prefill_side_channel_port = 5559
 
-    def _select_decode_peer(self):
+    def _select_decode_peer(self, routing_key, prompt_ids):
         # Borrow the real implementation to keep the stub aligned with
         # production rotation semantics — _pd_dispatch's behavior must not
         # depend on the test's peer-selection policy.
         from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
-        return vLLMHttpServer._select_decode_peer(self)
+        return vLLMHttpServer._select_decode_peer(self, routing_key, prompt_ids)
 
 
 def _import_http_server():
@@ -448,16 +479,15 @@ def _import_http_server():
 def test_select_decode_peer_round_robin_cycles():
     server_cls = _import_http_server()
     stub = _DispatchStub(decode_peers=["peer0", "peer1", "peer2"])
-    picks = [server_cls._select_decode_peer(stub) for _ in range(7)]
+    picks = [server_cls._select_decode_peer(stub, "session", [1])[1] for _ in range(7)]
     assert picks == ["peer0", "peer1", "peer2", "peer0", "peer1", "peer2", "peer0"]
-    # Internal counter advances exactly once per call.
-    assert stub._pd_peer_idx == 7
+    assert stub._pd_decode_selector.pending_requests == [3, 2, 2]
 
 
 def test_select_decode_peer_single_peer_returns_same():
     server_cls = _import_http_server()
     stub = _DispatchStub(decode_peers=["only_peer"])
-    assert all(server_cls._select_decode_peer(stub) == "only_peer" for _ in range(5))
+    assert all(server_cls._select_decode_peer(stub, "session", [1])[1] == "only_peer" for _ in range(5))
 
 
 def test_select_decode_peer_distribution_balanced_at_32_with_3_peers():
@@ -467,7 +497,7 @@ def test_select_decode_peer_distribution_balanced_at_32_with_3_peers():
     future change that randomizes for cache-locality but loses balance)."""
     server_cls = _import_http_server()
     stub = _DispatchStub(decode_peers=["peer0", "peer1", "peer2"])
-    counts = Counter(server_cls._select_decode_peer(stub) for _ in range(32))
+    counts = Counter(server_cls._select_decode_peer(stub, "session", [1])[1] for _ in range(32))
     assert sorted(counts.values()) == [10, 11, 11], (
         f"expected (10, 11, 11) hit counts under strict round-robin, got {dict(counts)}"
     )
@@ -543,6 +573,7 @@ async def test_pd_dispatch_routes_prefill_leg_then_decode_peer():
     assert dkw.kwargs["priority"] == 0
 
     assert result.token_ids == expected_decode_token_ids
+    assert stub._pd_decode_selector.pending_requests == [0]
 
 
 @pytest.mark.asyncio
@@ -612,6 +643,38 @@ async def test_pd_dispatch_raises_when_prefill_returns_no_kv_params():
             sampling_params={"max_tokens": 8},
             request_id="req-bare",
         )
+    assert stub._pd_decode_selector.pending_requests == [0]
+
+
+@pytest.mark.asyncio
+async def test_pd_dispatch_releases_reservation_when_decode_is_cancelled():
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from verl.workers.rollout.replica import TokenOutput
+
+    server_cls = _import_http_server()
+    decode_peer = MagicMock()
+
+    async def cancelled_decode():
+        raise asyncio.CancelledError
+
+    decode_peer.generate.remote = MagicMock(return_value=cancelled_decode())
+
+    async def fake_generate(prompt_ids, sampling_params, request_id, **kw):
+        return TokenOutput(token_ids=[0], stop_reason="completed", extra_fields={"kv_transfer_params": {}})
+
+    stub = _DispatchStub(decode_peers=[decode_peer])
+    stub.generate = fake_generate
+
+    with pytest.raises(asyncio.CancelledError):
+        await server_cls._pd_dispatch(
+            stub,
+            prompt_ids=[1],
+            sampling_params={"max_tokens": 8},
+            request_id="req-cancelled",
+        )
+    assert stub._pd_decode_selector.pending_requests == [0]
 
 
 def _make_awaitable_token_output(token_ids):

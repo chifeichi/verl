@@ -461,7 +461,7 @@ mtp: ${oc.select:actor_rollout_ref.model.mtp, null}
 # QAT configuration (inherited from actor's engine config)
 qat: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat,${oc.select:actor_rollout_ref.actor.megatron.qat,null}}
 
-# Prefill-Decode disaggregation (SGLang only; keep rollout.name=sglang and toggle enabled=True).
+# Prefill-Decode disaggregation.
 disaggregation:
 
   # Master switch for PD disaggregation.
@@ -472,6 +472,16 @@ disaggregation:
 
   # Number of decode replicas.
   decode_replicas: 1
+
+  # P-to-D routing policy. Policy names and policy-specific defaults follow vLLM Router.
+  # round_robin preserves Verl's existing default behavior.
+  # Policy-specific options may be added under decode_policy:
+  # power_of_two: load_check_interval_secs=5
+  # consistent_hash: virtual_nodes=160
+  # cache_aware: cache_threshold=0.3, balance_abs_threshold=64,
+  # balance_rel_threshold=1.5, eviction_interval_secs=120, max_tree_size=67108864
+  decode_policy:
+    type: round_robin
 
   # Decode TP override; null = same as tensor_model_parallel_size.
   decode_tensor_model_parallel_size: null

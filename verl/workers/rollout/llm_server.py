@@ -260,6 +260,9 @@ class LLMServerClient:
             priority_kwargs = (
                 {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
             )
+            rollout_config = self.config.actor_rollout_ref.rollout
+            if rollout_config.name == "vllm" and rollout_config.disaggregation.enabled:
+                kwargs.setdefault("routing_key", request_id)
             output: TokenOutput = await server.generate.remote(
                 request_id=uuid4().hex,  # use new request_id for each turn
                 prompt_ids=prompt_ids,

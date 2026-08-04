@@ -366,6 +366,8 @@ actor_rollout_ref:
       enabled: false
       prefill_replicas: 1
       decode_replicas: 1
+      decode_policy:
+        type: round_robin
       decode_tensor_model_parallel_size: null
       transfer_backend: nixl
       bootstrap_port: null

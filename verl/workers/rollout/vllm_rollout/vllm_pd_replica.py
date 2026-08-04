@@ -197,8 +197,16 @@ class vLLMPDReplica(vLLMReplica):
             for sock in reserved_socks:
                 sock.close()
 
+        decode_addresses = await asyncio.gather(
+            *[server.get_server_address.remote() for server in self._decode_servers]
+        )
+        decode_peer_ids = [
+            f"http://[{host}]:{port}" if is_valid_ipv6_address(host) else f"http://{host}:{port}"
+            for host, port in decode_addresses
+        ]
         await self._prefill_servers[0].set_pd_peer.remote(
             self._decode_servers,
+            decode_peer_ids,
             prefill_side_channel_port,
             prefill_engine_id,
         )
