@@ -651,6 +651,15 @@ class vLLMHttpServer:
         # least one token of headroom to be able to generate at all.
         max_possible_tokens = self.config.max_model_len - len(prompt_ids)
         if max_possible_tokens < 1:
+            pd_stall_print(
+                "[PD_STALL] role=verl_%s stage=generate_precheck_error "
+                "request_id=%s error=prompt_too_long prompt_tokens=%s max_model_len=%s",
+                self._disaggregation_role,
+                request_id,
+                len(prompt_ids),
+                self.config.max_model_len,
+            )
+            self._pd_stall_stages.pop(request_id, None)
             raise ValueError(
                 f"Prompt length ({len(prompt_ids)}) leaves no room to generate within the "
                 f"model's maximum context length ({self.config.max_model_len}); need at least "
@@ -690,7 +699,26 @@ class vLLMHttpServer:
             extra_args["kv_transfer_params"] = kv_transfer_params
             sampling_params["extra_args"] = extra_args
 
-        sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+        pd_stall_print(
+            "[PD_STALL] role=verl_%s stage=sampling_params_build_enter "
+            "request_id=%s max_tokens=%s",
+            self._disaggregation_role,
+            request_id,
+            max_tokens,
+        )
+        try:
+            sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+        except BaseException as exc:
+            pd_stall_print(
+                "[PD_STALL] role=verl_%s stage=sampling_params_build_error "
+                "request_id=%s error_type=%s error=%r",
+                self._disaggregation_role,
+                request_id,
+                type(exc).__name__,
+                exc,
+            )
+            self._pd_stall_stages.pop(request_id, None)
+            raise
         self._pd_stall_stages[request_id] = "sampling_params_ready"
         pd_stall_print(
             "[PD_STALL] role=verl_%s stage=sampling_params_ready request_id=%s",
@@ -896,7 +924,7 @@ class vLLMHttpServer:
                 transfer_id,
                 decode_index,
             )
-            decode_result = decode_peer.generate.remote(
+            decode_result_ref = decode_peer.generate.remote(
                 prompt_ids,
                 dict(sampling_params),
                 request_id,
@@ -907,6 +935,40 @@ class vLLMHttpServer:
                 priority=priority,
                 kv_transfer_params=decode_kv_params,
             )
+            decode_result = asyncio.ensure_future(decode_result_ref)
+
+            def _report_early_decode_result(task: asyncio.Future) -> None:
+                if task.cancelled():
+                    pd_stall_print(
+                        "[PD_STALL] role=verl_prefill stage=decode_rpc_cancelled "
+                        "request_id=%s transfer_id=%s decode_index=%s",
+                        request_id,
+                        transfer_id,
+                        decode_index,
+                    )
+                    return
+                exc = task.exception()
+                if exc is not None:
+                    pd_stall_print(
+                        "[PD_STALL] role=verl_prefill stage=decode_rpc_error "
+                        "request_id=%s transfer_id=%s decode_index=%s "
+                        "error_type=%s error=%r",
+                        request_id,
+                        transfer_id,
+                        decode_index,
+                        type(exc).__name__,
+                        exc,
+                    )
+                else:
+                    pd_stall_print(
+                        "[PD_STALL] role=verl_prefill stage=decode_rpc_done "
+                        "request_id=%s transfer_id=%s decode_index=%s",
+                        request_id,
+                        transfer_id,
+                        decode_index,
+                    )
+
+            decode_result.add_done_callback(_report_early_decode_result)
             timeout_s = float(os.environ.get("VERL_PD_METASERVER_TIMEOUT_S", "300"))
             try:
                 self._pd_stall_stages[request_id] = "metadata_wait"
