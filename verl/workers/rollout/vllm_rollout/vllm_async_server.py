@@ -942,8 +942,9 @@ class vLLMHttpServer:
             "metaserver": f"{self._pd_metaserver_base_url}/{transfer_id}",
         }
 
+        metadata_wait: asyncio.Task | None = None
         try:
-            decode_result = decode_peer.generate.remote(
+            decode_result_ref = decode_peer.generate.remote(
                 prompt_ids,
                 dict(sampling_params),
                 request_id,
@@ -954,8 +955,20 @@ class vLLMHttpServer:
                 priority=priority,
                 kv_transfer_params=decode_kv_params,
             )
+            decode_result = asyncio.ensure_future(decode_result_ref)
             timeout_s = float(os.environ.get("VERL_PD_METASERVER_TIMEOUT_S", "300"))
-            prefill_kv_params = await asyncio.wait_for(metadata_future, timeout=timeout_s)
+            metadata_wait = asyncio.create_task(asyncio.wait_for(metadata_future, timeout=timeout_s))
+            completed, _ = await asyncio.wait(
+                (metadata_wait, decode_result),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if decode_result in completed:
+                decode_result.result()
+                raise RuntimeError(
+                    "Decode completed before producing layerwise metadata "
+                    f"(request_id={request_id}, transfer_id={transfer_id})"
+                )
+            prefill_kv_params = metadata_wait.result()
             prefill_sp = dict(sampling_params)
             prefill_sp.pop("max_tokens", None)
             prefill_sp.pop("max_new_tokens", None)
@@ -979,6 +992,8 @@ class vLLMHttpServer:
                 logger.exception("Failed to abort layerwise decode request %s after PD dispatch failed", request_id)
             raise
         finally:
+            if metadata_wait is not None and not metadata_wait.done():
+                metadata_wait.cancel()
             self._pd_layerwise_meta_futures.pop(transfer_id, None)
 
     async def wake_up(self, tags: list[str] | None = None):
