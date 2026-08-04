@@ -608,6 +608,15 @@ class vLLMHttpServer:
         Args:
             kv_transfer_params: vLLM KV-transfer payload for PD requests.
         """
+        self._pd_stall_stages[request_id] = "generate_enter"
+        pd_stall_print(
+            "[PD_STALL] role=verl_%s stage=generate_method_enter "
+            "request_id=%s prompt_tokens=%s has_kv_params=%s",
+            self._disaggregation_role,
+            request_id,
+            len(prompt_ids),
+            kv_transfer_params is not None,
+        )
         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
             pd_stall_print(
                 "[PD_STALL] role=verl_prefill stage=dispatch_enter "
@@ -627,6 +636,14 @@ class vLLMHttpServer:
             )
 
         prompt_ids = normalize_token_ids(prompt_ids)
+        self._pd_stall_stages[request_id] = "tokens_normalized"
+        pd_stall_print(
+            "[PD_STALL] role=verl_%s stage=tokens_normalized "
+            "request_id=%s prompt_tokens=%s",
+            self._disaggregation_role,
+            request_id,
+            len(prompt_ids),
+        )
 
         # Calculate the maximum possible new tokens based on available context space
         # This serves as a safety upper bound. vLLM v0.20+ rejects `max_tokens < 1`
@@ -674,6 +691,12 @@ class vLLMHttpServer:
             sampling_params["extra_args"] = extra_args
 
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+        self._pd_stall_stages[request_id] = "sampling_params_ready"
+        pd_stall_print(
+            "[PD_STALL] role=verl_%s stage=sampling_params_ready request_id=%s",
+            self._disaggregation_role,
+            request_id,
+        )
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
         if image_data is not None:
@@ -690,12 +713,29 @@ class vLLMHttpServer:
             prompt = TokensPrompt(**prompt_kwargs)
         except TypeError:
             prompt = prompt_kwargs
+        self._pd_stall_stages[request_id] = "prompt_ready"
+        pd_stall_print(
+            "[PD_STALL] role=verl_%s stage=prompt_ready request_id=%s",
+            self._disaggregation_role,
+            request_id,
+        )
 
         # Add lora request
         lora_request = None
         if self.lora_as_adapter:
             # Make sure we also check that the lora is already loaded in the engine
+            self._pd_stall_stages[request_id] = "lora_list_wait"
+            pd_stall_print(
+                "[PD_STALL] role=verl_%s stage=lora_list_enter request_id=%s",
+                self._disaggregation_role,
+                request_id,
+            )
             lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
+            pd_stall_print(
+                "[PD_STALL] role=verl_%s stage=lora_list_done request_id=%s",
+                self._disaggregation_role,
+                request_id,
+            )
             if lora_loaded:
                 lora_request = LoRARequest(
                     lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
