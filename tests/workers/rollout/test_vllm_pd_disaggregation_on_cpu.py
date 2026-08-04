@@ -26,6 +26,7 @@ vLLM-engine tests behind ``@pytest.mark.skipif(not CUDA_AVAILABLE)``.
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from unittest.mock import patch
 
@@ -211,6 +212,10 @@ def _build_kv_cfg(
     engine_id: str = "test-eid",
     transfer_backend: str = "nixl",
     mooncake_protocol=None,
+    use_ascend_layerwise: bool = False,
+    kv_port=None,
+    prefill_tp=None,
+    decode_tp=None,
 ):
     # Lazy import: only meaningful when vllm-rollout deps are importable.
     pytest.importorskip("vllm")
@@ -221,6 +226,10 @@ def _build_kv_cfg(
         engine_id=engine_id,
         transfer_backend=transfer_backend,
         mooncake_protocol=mooncake_protocol,
+        use_ascend_layerwise=use_ascend_layerwise,
+        kv_port=kv_port,
+        prefill_tp=prefill_tp,
+        decode_tp=decode_tp,
     )
 
 
@@ -271,6 +280,34 @@ def test_build_kv_transfer_config_mooncake_protocol_ignored_for_nixl():
     the NIXL connector ignores it (UCX picks transport on its own)."""
     cfg = _build_kv_cfg(role="prefill", transfer_backend="nixl", mooncake_protocol="nvlink")
     assert "kv_connector_extra_config" not in cfg
+
+
+@pytest.mark.parametrize("role,expected_role", [("prefill", "kv_producer"), ("decode", "kv_consumer")])
+def test_build_kv_transfer_config_ascend_layerwise(role, expected_role):
+    cfg = _build_kv_cfg(
+        role=role,
+        transfer_backend="mooncake",
+        use_ascend_layerwise=True,
+        kv_port=19001,
+        prefill_tp=4,
+        decode_tp=2,
+    )
+    assert cfg["kv_connector"] == "MooncakeLayerwiseConnector"
+    assert cfg["kv_role"] == expected_role
+    assert cfg["kv_port"] == 19001
+    assert cfg["kv_connector_extra_config"] == {
+        "prefill": {"dp_size": 1, "tp_size": 4},
+        "decode": {"dp_size": 1, "tp_size": 2},
+    }
+
+
+def test_build_kv_transfer_config_ascend_layerwise_requires_topology():
+    with pytest.raises(ValueError, match="requires kv_port, prefill_tp, and decode_tp"):
+        _build_kv_cfg(
+            role="prefill",
+            transfer_backend="mooncake",
+            use_ascend_layerwise=True,
+        )
 
 
 @pytest.mark.parametrize("protocol", ["nvlink", "local", "rdma", "tcp"])
@@ -459,6 +496,8 @@ class _DispatchStub:
         self._pd_prefill_engine_id = "eid-prefill"
         self._pd_prefill_side_channel_host = "127.0.0.1"
         self._pd_prefill_side_channel_port = 5559
+        self._pd_metaserver_base_url = "http://127.0.0.1:8000/verl/pd/metaserver"
+        self._pd_layerwise_meta_futures = {}
 
     def _select_decode_peer(self, routing_key, prompt_ids):
         # Borrow the real implementation to keep the stub aligned with
@@ -467,6 +506,11 @@ class _DispatchStub:
         from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
         return vLLMHttpServer._select_decode_peer(self, routing_key, prompt_ids)
+
+    async def _pd_dispatch_ascend_layerwise(self, **kwargs):
+        from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
+
+        return await vLLMHttpServer._pd_dispatch_ascend_layerwise(self, **kwargs)
 
 
 def _import_http_server():
@@ -621,6 +665,51 @@ async def test_pd_dispatch_mooncake_constructs_decode_kv_params_locally():
     assert dkv["remote_bootstrap_addr"] == f"http://127.0.0.1:{stub._pd_prefill_side_channel_port}"
     # transfer_id must match across legs so prefill and decode rendezvous.
     assert dkv["transfer_id"] == transfer_id
+
+
+@pytest.mark.asyncio
+async def test_pd_dispatch_ascend_layerwise_starts_decode_before_prefill():
+    from unittest.mock import MagicMock
+
+    from verl.workers.rollout.replica import TokenOutput
+
+    server_cls = _import_http_server()
+    decode_peer = MagicMock()
+    events = []
+    stub = _DispatchStub(decode_peers=[decode_peer], connector="MooncakeLayerwiseConnector")
+
+    def start_decode(prompt_ids, sampling_params, request_id, **kwargs):
+        events.append("decode_start")
+        transfer_id = kwargs["kv_transfer_params"]["metaserver"].rsplit("/", 1)[-1]
+        metadata = {"do_remote_decode": True, "do_remote_prefill": False, "transfer_id": transfer_id}
+        asyncio.get_running_loop().call_soon(stub._pd_layerwise_meta_futures[transfer_id].set_result, metadata)
+        return _make_awaitable_token_output([7, 8])
+
+    decode_peer.generate.remote = MagicMock(side_effect=start_decode)
+    decode_peer.abort_request.remote = MagicMock()
+    captured_prefill = []
+
+    async def fake_generate(prompt_ids, sampling_params, request_id, **kwargs):
+        events.append("prefill")
+        captured_prefill.append((sampling_params, request_id, kwargs["kv_transfer_params"]))
+        return TokenOutput(token_ids=[42], stop_reason="completed")
+
+    stub.generate = fake_generate
+    result = await server_cls._pd_dispatch(
+        stub,
+        prompt_ids=[1, 2, 3],
+        sampling_params={"max_tokens": 16, "temperature": 0.0},
+        request_id="req-layerwise",
+    )
+
+    assert events == ["decode_start", "prefill"]
+    assert result.token_ids == [7, 8]
+    assert captured_prefill[0][0]["max_tokens"] == 1
+    assert captured_prefill[0][1] == "req-layerwise"
+    assert captured_prefill[0][2]["do_remote_decode"] is True
+    decode_peer.abort_request.remote.assert_not_called()
+    assert stub._pd_layerwise_meta_futures == {}
+    assert stub._pd_decode_selector.pending_requests == [0]
 
 
 @pytest.mark.asyncio
