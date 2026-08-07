@@ -268,11 +268,11 @@ class vLLMPDReplica(vLLMReplica):
         await asyncio.gather(
             *[
                 prefill_server.set_pd_peer.remote(
-                    self._decode_servers,
-                    decode_peer_ids,
-                    prefill_side_channel_hosts[index],
-                    prefill_side_channel_ports[index],
-                    prefill_engine_ids[index],
+                    decode_peers=self._decode_servers,
+                    decode_peer_ids=decode_peer_ids,
+                    prefill_side_channel_host=prefill_side_channel_hosts[index],
+                    prefill_side_channel_port=prefill_side_channel_ports[index],
+                    prefill_engine_id=prefill_engine_ids[index],
                 )
                 for index, prefill_server in enumerate(self._prefill_servers)
             ]
@@ -378,6 +378,7 @@ class vLLMPDReplica(vLLMReplica):
             # Avoid Mooncake TCP port exhaustion under validation concurrency.
             "MC_TCP_ENABLE_CONNECTION_POOL": os.environ.get("MC_TCP_ENABLE_CONNECTION_POOL", "1"),
             "VERL_PD_ROUTING_LOG_EVERY": os.environ.get("VERL_PD_ROUTING_LOG_EVERY", "0"),
+            "VERL_PD_TIMING_LOG_EVERY": os.environ.get("VERL_PD_TIMING_LOG_EVERY", "0"),
             "VERL_ZMQ_BASE_TRAINER_RANK": str(zmq_base_trainer_rank),
             "VERL_RAY_JOB_ID": ray.get_runtime_context().get_job_id(),
         }
