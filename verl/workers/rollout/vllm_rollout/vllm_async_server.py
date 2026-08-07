@@ -137,8 +137,17 @@ class vLLMHttpServer:
             )
         self._disaggregation_role = disaggregation_role
         self._disaggregation_kv_transfer_config = disaggregation_kv_transfer_config
+        if disaggregation_role != "null":
+            logger.warning(
+                "[VERL_PD_ROLE] role=%s pid=%s replica_rank=%s devices=%s",
+                disaggregation_role,
+                os.getpid(),
+                replica_rank,
+                cuda_visible_devices,
+            )
         # Filled by vLLMPDReplica.set_pd_peer for prefill-side routing.
         self._pd_decode_peers: list[ActorHandle] = []
+        self._pd_prefill_side_channel_host: Optional[str] = None
         self._pd_prefill_side_channel_port: Optional[int] = None
         self._pd_prefill_engine_id: Optional[str] = None
         self._pd_decode_selector: Optional[DecodePeerSelector] = None
@@ -151,6 +160,11 @@ class vLLMHttpServer:
         except ValueError:
             self._pd_routing_log_every = 0
             logger.warning("Ignoring invalid VERL_PD_ROUTING_LOG_EVERY; routing trace is disabled")
+        try:
+            self._pd_timing_log_every = max(0, int(os.environ.get("VERL_PD_TIMING_LOG_EVERY", "0")))
+        except ValueError:
+            self._pd_timing_log_every = 0
+            logger.warning("Ignoring invalid VERL_PD_TIMING_LOG_EVERY; PD timing trace is disabled")
 
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
         os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
@@ -257,6 +271,7 @@ class vLLMHttpServer:
         self,
         decode_peers: list,
         decode_peer_ids: list[str],
+        prefill_side_channel_host: str,
         prefill_side_channel_port: int,
         prefill_engine_id: str,
     ) -> None:
@@ -267,6 +282,7 @@ class vLLMHttpServer:
         if len(decode_peer_ids) != len(decode_peers):
             raise ValueError("decode_peer_ids must have one stable identity per decode peer")
         self._pd_decode_peers = list(decode_peers)
+        self._pd_prefill_side_channel_host = prefill_side_channel_host
         self._pd_prefill_side_channel_port = prefill_side_channel_port
         self._pd_prefill_engine_id = prefill_engine_id
         self._pd_decode_selector = DecodePeerSelector(
@@ -861,12 +877,18 @@ class vLLMHttpServer:
             )
             if is_mooncake:
                 # Mooncake does not return decode params from the prefill leg.
+                if self._pd_prefill_side_channel_host is None:
+                    raise RuntimeError("prefill side-channel host is not configured")
+                bootstrap_host = (
+                    f"[{self._pd_prefill_side_channel_host}]"
+                    if is_valid_ipv6_address(self._pd_prefill_side_channel_host)
+                    else self._pd_prefill_side_channel_host
+                )
                 decode_kv_params = {
                     "do_remote_decode": False,
                     "do_remote_prefill": True,
                     "remote_engine_id": self._pd_prefill_engine_id,
-                    # Single-node PD uses Mooncake's local bootstrap address.
-                    "remote_bootstrap_addr": f"http://127.0.0.1:{self._pd_prefill_side_channel_port}",
+                    "remote_bootstrap_addr": f"http://{bootstrap_host}:{self._pd_prefill_side_channel_port}",
                     "transfer_id": transfer_id,
                 }
             else:
@@ -933,6 +955,16 @@ class vLLMHttpServer:
         if self._pd_metaserver_base_url is None:
             raise RuntimeError("Ascend PD metaserver is unavailable before the prefill HTTP server starts")
 
+        timing_enabled = (
+            self._pd_timing_log_every > 0
+            and int.from_bytes(hashlib.sha256(request_id.encode()).digest()[:8], "big") % self._pd_timing_log_every == 0
+        )
+        dispatch_started_at = time.perf_counter() if timing_enabled else 0.0
+        metadata_received_at: float | None = None
+        prefill_finished_at: float | None = None
+        decode_finished_at: float | None = None
+        decode_result_value: TokenOutput | None = None
+        error_type: str | None = None
         transfer_id = uuid.uuid4().hex
         metadata_future = asyncio.get_running_loop().create_future()
         self._pd_layerwise_meta_futures[transfer_id] = metadata_future
@@ -969,6 +1001,8 @@ class vLLMHttpServer:
                     f"(request_id={request_id}, transfer_id={transfer_id})"
                 )
             prefill_kv_params = metadata_wait.result()
+            if timing_enabled:
+                metadata_received_at = time.perf_counter()
             prefill_sp = dict(sampling_params)
             prefill_sp.pop("max_tokens", None)
             prefill_sp.pop("max_new_tokens", None)
@@ -984,8 +1018,14 @@ class vLLMHttpServer:
                 priority=priority,
                 kv_transfer_params=prefill_kv_params,
             )
-            return await decode_result
-        except BaseException:
+            if timing_enabled:
+                prefill_finished_at = time.perf_counter()
+            decode_result_value = await decode_result
+            if timing_enabled:
+                decode_finished_at = time.perf_counter()
+            return decode_result_value
+        except BaseException as exc:
+            error_type = type(exc).__name__
             try:
                 await decode_peer.abort_request.remote(request_id, reset_prefix_cache=False)
             except Exception:
@@ -995,6 +1035,41 @@ class vLLMHttpServer:
             if metadata_wait is not None and not metadata_wait.done():
                 metadata_wait.cancel()
             self._pd_layerwise_meta_futures.pop(transfer_id, None)
+            if timing_enabled:
+                finished_at = decode_finished_at or time.perf_counter()
+                logger.info(
+                    "[VERL_PD_TIMING] %s",
+                    json.dumps(
+                        {
+                            "request_id": request_id,
+                            "replica_rank": self.replica_rank,
+                            "prompt_tokens": len(prompt_ids),
+                            "output_tokens": (
+                                len(decode_result_value.token_ids) if decode_result_value is not None else None
+                            ),
+                            "d_metadata_ms": (
+                                round((metadata_received_at - dispatch_started_at) * 1000, 3)
+                                if metadata_received_at is not None
+                                else None
+                            ),
+                            "p_prefill_transfer_ms": (
+                                round((prefill_finished_at - metadata_received_at) * 1000, 3)
+                                if prefill_finished_at is not None and metadata_received_at is not None
+                                else None
+                            ),
+                            "d_tail_ms": (
+                                round((decode_finished_at - prefill_finished_at) * 1000, 3)
+                                if decode_finished_at is not None and prefill_finished_at is not None
+                                else None
+                            ),
+                            "total_ms": round((finished_at - dispatch_started_at) * 1000, 3),
+                            "status": "error" if error_type is not None else "completed",
+                            "error_type": error_type,
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                )
 
     async def wake_up(self, tags: list[str] | None = None):
         if self.node_rank != 0:
@@ -1478,8 +1553,12 @@ class vLLMReplica(RolloutReplica):
 
     async def sleep(self):
         """Sleep each rollout server."""
-        # Drain DP engines for safe sleep.
-        await self.servers[0].wait_for_requests_to_drain.remote()
+        # Drain request ingress servers for safe sleep. A PD prefill request
+        # remains in flight until its decode leg returns, so decode servers do
+        # not need a separate drain barrier here.
+        await asyncio.gather(
+            *[server.wait_for_requests_to_drain.remote() for _, server in self.get_request_server_endpoints()]
+        )
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
 
     async def abort_all_requests(self) -> dict[str, Any]:
@@ -1526,7 +1605,9 @@ class vLLMReplica(RolloutReplica):
     async def release_kv_cache(self):
         # Drain all in-flight requests so that vLLM worker threads go idle
         # before we touch engine.release_kv_cache()
-        await self.servers[0].wait_for_requests_to_drain.remote()
+        await asyncio.gather(
+            *[server.wait_for_requests_to_drain.remote() for _, server in self.get_request_server_endpoints()]
+        )
         await asyncio.gather(*[server.release_kv_cache.remote() for server in self.servers])
 
     # -----------------------------------------------------------------------

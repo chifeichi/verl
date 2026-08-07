@@ -253,6 +253,18 @@ class RolloutReplica(ABC):
         """Get rollout server handle for Token-in-token-out generation."""
         return self._server_handle
 
+    def get_request_server_endpoints(self) -> list[tuple[str, ActorHandle]]:
+        """Return the server endpoints that can accept generation requests.
+
+        Most rollout replicas expose one endpoint. Composite replicas, such as
+        a PD replica with multiple prefill servers, can override this method to
+        expose every request ingress while keeping lifecycle operations scoped
+        to the parent replica.
+        """
+        if self._server_address is None or self._server_handle is None:
+            raise RuntimeError("rollout server has not been launched")
+        return [(self._server_address, self._server_handle)]
+
     @property
     def max_concurrency(self) -> int:
         # 1000 is Ray's default max_concurrency for async execution.

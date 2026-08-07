@@ -17,11 +17,10 @@ Covers Phase 1 of the verl-vllm-pd-disagg series:
   * ``DisaggregationConfig`` validation rules
   * ``RolloutConfig`` post_init coercion + name-vs-disagg.enabled gate
   * ``get_rollout_replica_class("vllm", disaggregation_enabled=True)`` resolves to ``vLLMPDReplica``
-  * ``vLLMPDReplica`` config validation paths (NIXL-only, single-node MVP)
+  * ``vLLMPDReplica`` config validation paths and multi-P/multi-D sizing
   * ``vLLMPDReplica._build_kv_transfer_config`` JSON shape
 
-Phase 2 (NIXL 1P:1D smoke) and Phase 3 (1P:ND scaling) add live Ray-actor and
-vLLM-engine tests behind ``@pytest.mark.skipif(not CUDA_AVAILABLE)``.
+Live Ray-actor and vLLM-engine coverage remains behind GPU integration tests.
 """
 
 from __future__ import annotations
@@ -444,21 +443,44 @@ def test_pd_replica_init_rejects_unsupported_backend(patched_replica_cls):
         patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
 
 
-def test_pd_replica_init_rejects_multi_prefill(patched_replica_cls):
-    cfg = _make_pd_config(prefill_replicas=2)
-    with pytest.raises(NotImplementedError, match="prefill_replicas=1"):
-        patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+def test_pd_replica_init_accepts_multi_prefill_shared_decode_pool(patched_replica_cls):
+    cfg = _make_pd_config(prefill_replicas=2, decode_replicas=3)
+    replica = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+
+    assert replica._n_prefill == 2
+    assert replica._n_decode == 3
+    assert replica.world_size == 5
+
+
+def test_pd_replica_init_accepts_multi_node_pool(patched_replica_cls):
+    cfg = _make_pd_config(
+        prefill_replicas=2,
+        decode_replicas=2,
+        tensor_model_parallel_size=4,
+        decode_tensor_model_parallel_size=4,
+    )
+    replica = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+
+    assert replica.world_size == 16
+    assert replica.nnodes == 2
+
+
+def test_pd_replica_exposes_every_prefill_as_request_endpoint(patched_replica_cls):
+    cfg = _make_pd_config(prefill_replicas=2, decode_replicas=2)
+    replica = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+    handles = [object(), object()]
+    replica._prefill_servers = handles
+    replica._prefill_server_addresses = ["p0:8000", "p1:8000"]
+
+    assert replica.get_request_server_endpoints() == [
+        ("p0:8000", handles[0]),
+        ("p1:8000", handles[1]),
+    ]
 
 
 def test_pd_replica_init_rejects_dp_gt_1(patched_replica_cls):
     cfg = _make_pd_config(data_parallel_size=2)
     with pytest.raises(NotImplementedError, match="data_parallel_size=1"):
-        patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
-
-
-def test_pd_replica_init_rejects_oversized_world(patched_replica_cls):
-    cfg = _make_pd_config(decode_replicas=8)  # 1 + 8 = 9 GPUs needed
-    with pytest.raises(NotImplementedError, match="single-node only"):
         patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
 
 
@@ -666,7 +688,9 @@ async def test_pd_dispatch_mooncake_constructs_decode_kv_params_locally():
     assert dkv["do_remote_prefill"] is True
     assert dkv["do_remote_decode"] is False
     assert dkv["remote_engine_id"] == stub._pd_prefill_engine_id
-    assert dkv["remote_bootstrap_addr"] == f"http://127.0.0.1:{stub._pd_prefill_side_channel_port}"
+    assert dkv["remote_bootstrap_addr"] == (
+        f"http://{stub._pd_prefill_side_channel_host}:{stub._pd_prefill_side_channel_port}"
+    )
     # transfer_id must match across legs so prefill and decode rendezvous.
     assert dkv["transfer_id"] == transfer_id
 

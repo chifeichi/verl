@@ -11,8 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""vLLM PD-disaggregated replica: 1 prefill + N decode servers per replica,
-asymmetric TP supported. MVP: prefill_replicas=1, single-node only."""
+"""vLLM PD-disaggregated replica with M prefill and N decode servers.
+
+Prefill servers are independent request ingress points and share the decode
+pool. Asymmetric TP is supported. Each engine must fit on one node, while the
+composite PD replica may span multiple nodes.
+"""
 
 import asyncio
 import logging
@@ -31,6 +35,23 @@ from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+
+def _reserve_pd_port(worker) -> tuple[str, int]:
+    """Reserve a side-channel port in the worker's node-local process."""
+    host = ray.util.get_node_ip_address().strip("[]")
+    port, sock = get_free_port(host, with_alive_sock=True)
+    reservations = getattr(worker, "_verl_pd_port_reservations", [])
+    reservations.append(sock)
+    worker._verl_pd_port_reservations = reservations
+    return host, port
+
+
+def _release_pd_ports(worker) -> None:
+    """Release ports reserved by :func:`_reserve_pd_port`."""
+    for sock in getattr(worker, "_verl_pd_port_reservations", []):
+        sock.close()
+    worker._verl_pd_port_reservations = []
 
 
 class vLLMPDReplica(vLLMReplica):
@@ -65,8 +86,6 @@ class vLLMPDReplica(vLLMReplica):
                 f"revision; got {disagg.transfer_backend!r}. mori/ascend/fake are reserved "
                 f"in DisaggregationConfig and will land in follow-ups."
             )
-        if disagg.prefill_replicas != 1:
-            raise NotImplementedError(f"prefill_replicas=1 only (got {disagg.prefill_replicas})")
         self._n_prefill = disagg.prefill_replicas
         self._n_decode = disagg.decode_replicas
 
@@ -78,13 +97,7 @@ class vLLMPDReplica(vLLMReplica):
             else self._prefill_tp
         )
 
-        pd_world_size = self._prefill_tp + self._n_decode * self._decode_tp
-        if pd_world_size > gpus_per_node:
-            raise NotImplementedError(
-                f"PD replica needs {pd_world_size} GPUs but gpus_per_node={gpus_per_node}; "
-                f"single-node only in this revision (use more replicas to span nodes once "
-                f"multi-node lands)"
-            )
+        pd_world_size = self._n_prefill * self._prefill_tp + self._n_decode * self._decode_tp
         if self.config.data_parallel_size != 1:
             raise NotImplementedError(f"data_parallel_size=1 only (got {self.config.data_parallel_size})")
         if self.config.pipeline_model_parallel_size != 1:
@@ -100,6 +113,7 @@ class vLLMPDReplica(vLLMReplica):
 
         self._prefill_servers: list[ActorHandle] = []
         self._decode_servers: list[ActorHandle] = []
+        self._prefill_server_addresses: list[str] = []
 
     async def launch_servers(self):
         assert len(self.workers) == self.world_size, (
@@ -127,55 +141,80 @@ class vLLMPDReplica(vLLMReplica):
             ]
         )
 
-        # Bind the side-channel on the prefill worker's node.
-        prefill_host_ip = worker_infos[0][2]
-        prefill_engine_id = uuid.uuid4().hex
-
-        prefill_end = self._prefill_tp
-        prefill_workers = self.workers[0:prefill_end]
-        prefill_node_id = worker_infos[0][0]
-        prefill_devs = self._collect_cuda_devices(worker_infos[0:prefill_end])
-
-        # Keep side-channel sockets reserved until all actors bind.
-        reserved_socks = []
-        prefill_side_channel_port, prefill_sock = get_free_port(prefill_host_ip, with_alive_sock=True)
-        reserved_socks.append(prefill_sock)
-        try:
-            prefill_kv_cfg = self._build_kv_transfer_config(
-                role="prefill",
-                engine_id=prefill_engine_id,
-                transfer_backend=transfer_backend,
-                mooncake_protocol=self.config.disaggregation.mooncake_protocol,
-                use_ascend_layerwise=use_ascend_layerwise,
-                kv_port=prefill_side_channel_port,
-                prefill_tp=self._prefill_tp,
-                decode_tp=self._decode_tp,
-            )
-            self._prefill_servers = [
-                self._spawn_pd_server(
-                    role="prefill",
-                    workers=prefill_workers,
-                    node_id=prefill_node_id,
-                    cuda_visible_devices=prefill_devs,
-                    tp=self._prefill_tp,
-                    kv_transfer_config=prefill_kv_cfg,
-                    side_channel_host=prefill_host_ip,
-                    side_channel_port=prefill_side_channel_port,
-                    mooncake_bootstrap_port=prefill_side_channel_port,
-                    actor_name=f"vllm_server_{self.replica_rank}_0{self.name_suffix}",
-                    zmq_base_trainer_rank=0,
+        def engine_location(start: int, end: int, role: str, index: int) -> tuple[str, str]:
+            node_ids = {info[0] for info in worker_infos[start:end]}
+            if len(node_ids) != 1:
+                raise NotImplementedError(
+                    f"{role} replica {index} spans multiple nodes; each PD engine must fit on one node"
                 )
-            ]
+            return worker_infos[start][0], worker_infos[start][2]
+
+        prefill_engine_ids: list[str] = []
+        prefill_side_channel_hosts: list[str] = []
+        prefill_side_channel_ports: list[int] = []
+
+        reservation_workers: list[ActorHandle] = []
+        reservations_released = False
+        try:
+            for i in range(self._n_prefill):
+                start = i * self._prefill_tp
+                end = start + self._prefill_tp
+                prefill_workers = self.workers[start:end]
+                prefill_node_id, prefill_host_ip = engine_location(start, end, "prefill", i)
+                prefill_devs = self._collect_cuda_devices(worker_infos[start:end])
+                prefill_engine_id = uuid.uuid4().hex
+                reserved_host, prefill_side_channel_port = await prefill_workers[0].__ray_call__.remote(
+                    _reserve_pd_port
+                )
+                if reserved_host != prefill_host_ip:
+                    raise RuntimeError(
+                        f"prefill replica {i} worker moved nodes during launch: "
+                        f"expected {prefill_host_ip}, got {reserved_host}"
+                    )
+                reservation_workers.append(prefill_workers[0])
+                prefill_engine_ids.append(prefill_engine_id)
+                prefill_side_channel_hosts.append(prefill_host_ip)
+                prefill_side_channel_ports.append(prefill_side_channel_port)
+                prefill_kv_cfg = self._build_kv_transfer_config(
+                    role="prefill",
+                    engine_id=prefill_engine_id,
+                    transfer_backend=transfer_backend,
+                    mooncake_protocol=self.config.disaggregation.mooncake_protocol,
+                    use_ascend_layerwise=use_ascend_layerwise,
+                    kv_port=prefill_side_channel_port,
+                    prefill_tp=self._prefill_tp,
+                    decode_tp=self._decode_tp,
+                )
+                self._prefill_servers.append(
+                    self._spawn_pd_server(
+                        role="prefill",
+                        workers=prefill_workers,
+                        node_id=prefill_node_id,
+                        cuda_visible_devices=prefill_devs,
+                        tp=self._prefill_tp,
+                        kv_transfer_config=prefill_kv_cfg,
+                        side_channel_host=prefill_host_ip,
+                        side_channel_port=prefill_side_channel_port,
+                        mooncake_bootstrap_port=prefill_side_channel_port,
+                        actor_name=f"vllm_server_{self.replica_rank}_{i}{self.name_suffix}",
+                        zmq_base_trainer_rank=start,
+                    )
+                )
 
             for i in range(self._n_decode):
-                start = self._prefill_tp + i * self._decode_tp
+                start = self._n_prefill * self._prefill_tp + i * self._decode_tp
                 end = start + self._decode_tp
                 workers_i = self.workers[start:end]
-                node_id_i = worker_infos[start][0]
+                node_id_i, decode_host_ip = engine_location(start, end, "decode", i)
                 devs_i = self._collect_cuda_devices(worker_infos[start:end])
 
-                decode_side_channel_port, decode_sock = get_free_port(prefill_host_ip, with_alive_sock=True)
-                reserved_socks.append(decode_sock)
+                reserved_host, decode_side_channel_port = await workers_i[0].__ray_call__.remote(_reserve_pd_port)
+                if reserved_host != decode_host_ip:
+                    raise RuntimeError(
+                        f"decode replica {i} worker moved nodes during launch: "
+                        f"expected {decode_host_ip}, got {reserved_host}"
+                    )
+                reservation_workers.append(workers_i[0])
                 decode_kv_cfg = self._build_kv_transfer_config(
                     role="decode",
                     engine_id=uuid.uuid4().hex,
@@ -194,14 +233,18 @@ class vLLMPDReplica(vLLMReplica):
                         cuda_visible_devices=devs_i,
                         tp=self._decode_tp,
                         kv_transfer_config=decode_kv_cfg,
-                        side_channel_host=prefill_host_ip,
+                        side_channel_host=decode_host_ip,
                         side_channel_port=decode_side_channel_port,
-                        mooncake_bootstrap_port=prefill_side_channel_port,
+                        mooncake_bootstrap_port=decode_side_channel_port,
                         actor_name=f"vllm_server_decode_{self.replica_rank}_{i}{self.name_suffix}",
                         zmq_base_trainer_rank=start,
                     )
                 )
 
+            await asyncio.gather(
+                *[worker.__ray_call__.remote(_release_pd_ports) for worker in reservation_workers]
+            )
+            reservations_released = True
             await asyncio.gather(
                 *[
                     server.launch_server.remote(master_address=None, master_port=None, dp_rpc_port=None)
@@ -209,8 +252,11 @@ class vLLMPDReplica(vLLMReplica):
                 ]
             )
         finally:
-            for sock in reserved_socks:
-                sock.close()
+            if not reservations_released:
+                await asyncio.gather(
+                    *[worker.__ray_call__.remote(_release_pd_ports) for worker in reservation_workers],
+                    return_exceptions=True,
+                )
 
         decode_addresses = await asyncio.gather(
             *[server.get_server_address.remote() for server in self._decode_servers]
@@ -219,31 +265,42 @@ class vLLMPDReplica(vLLMReplica):
             f"http://[{host}]:{port}" if is_valid_ipv6_address(host) else f"http://{host}:{port}"
             for host, port in decode_addresses
         ]
-        await self._prefill_servers[0].set_pd_peer.remote(
-            self._decode_servers,
-            decode_peer_ids,
-            prefill_side_channel_port,
-            prefill_engine_id,
+        await asyncio.gather(
+            *[
+                prefill_server.set_pd_peer.remote(
+                    self._decode_servers,
+                    decode_peer_ids,
+                    prefill_side_channel_hosts[index],
+                    prefill_side_channel_ports[index],
+                    prefill_engine_ids[index],
+                )
+                for index, prefill_server in enumerate(self._prefill_servers)
+            ]
         )
 
         self.servers = list(self._prefill_servers) + list(self._decode_servers)
-        prefill_address, prefill_port = await self._prefill_servers[0].get_server_address.remote()
-        self._server_handle = self._prefill_servers[0]
-        self._server_address = (
-            f"[{prefill_address}]:{prefill_port}"
-            if is_valid_ipv6_address(prefill_address)
-            else f"{prefill_address}:{prefill_port}"
+        prefill_addresses = await asyncio.gather(
+            *[server.get_server_address.remote() for server in self._prefill_servers]
         )
+        self._prefill_server_addresses = [
+            f"[{host}]:{port}" if is_valid_ipv6_address(host) else f"{host}:{port}"
+            for host, port in prefill_addresses
+        ]
+        self._server_handle = self._prefill_servers[0]
+        self._server_address = self._prefill_server_addresses[0]
 
         logger.info(
-            "vLLMPDReplica rank=%s launched: prefill=%s (engine_id=%s, side_channel=%s:%d), decodes=%d",
+            "vLLMPDReplica rank=%s launched: prefills=%s, decodes=%d",
             self.replica_rank,
-            self._server_address,
-            prefill_engine_id,
-            prefill_host_ip,
-            prefill_side_channel_port,
+            self._prefill_server_addresses,
             len(self._decode_servers),
         )
+
+    def get_request_server_endpoints(self) -> list[tuple[str, ActorHandle]]:
+        """Expose every prefill server to the session-aware request router."""
+        if not self._prefill_servers or len(self._prefill_server_addresses) != len(self._prefill_servers):
+            raise RuntimeError("PD prefill servers have not been launched")
+        return list(zip(self._prefill_server_addresses, self._prefill_servers, strict=True))
 
     @staticmethod
     def _collect_cuda_devices(worker_infos) -> str:

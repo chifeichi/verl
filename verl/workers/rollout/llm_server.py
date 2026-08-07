@@ -533,8 +533,13 @@ class LLMServerManager:
         else:
             await asyncio.gather(*[server.init_standalone() for server in self.rollout_replicas])
 
-        self.server_handles = [server._server_handle for server in self.rollout_replicas]
-        self.server_addresses = [server._server_address for server in self.rollout_replicas]
+        request_endpoints = [
+            (replica, endpoint_index, address, handle)
+            for replica in self.rollout_replicas
+            for endpoint_index, (address, handle) in enumerate(replica.get_request_server_endpoints())
+        ]
+        self.server_addresses = [address for _, _, address, _ in request_endpoints]
+        self.server_handles = [handle for _, _, _, handle in request_endpoints]
         print(f"LLMServerManager: {self.server_addresses}")
 
         # Update Prometheus / rl-insight metrics with server addresses
@@ -551,7 +556,10 @@ class LLMServerManager:
                 RLInsightLogger.register_rollout_metrics(
                     self.server_addresses,
                     self.rollout_config.name,
-                    labels=[{"replica": server.replica_rank} for server in self.rollout_replicas],
+                    labels=[
+                        {"replica": replica.replica_rank, "request_endpoint": endpoint_index}
+                        for replica, endpoint_index, _, _ in request_endpoints
+                    ],
                 )
 
     async def _init_global_load_balancer(self) -> None:

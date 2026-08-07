@@ -68,6 +68,8 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         self.alive_replicas: dict[str, RolloutReplica] = {}
         # resource_id → server_address for alive hybrid replicas.
         self.alive_addresses: dict[str, str] = {}
+        # resource_id → every request endpoint registered for that replica.
+        self.alive_server_ids: dict[str, list[str]] = {}
         # Prometheus server addresses
         self.prometheus_server_addresses = []
 
@@ -168,7 +170,7 @@ class FullyAsyncLLMServerManager(LLMServerManager):
                     rid,
                 )
                 continue
-            servers_to_add[replica._server_address] = replica._server_handle
+            servers_to_add.update(dict(replica.get_request_server_endpoints()))
             valid_resource_ids.append(rid)
 
         if not servers_to_add:
@@ -181,15 +183,16 @@ class FullyAsyncLLMServerManager(LLMServerManager):
             # Track locally for introspection / Prometheus.
             for rid in valid_resource_ids:
                 replica = self.hybrid_replicas[rid]
-                server_address = replica._server_address
-                server_handle = replica._server_handle
-                if server_address not in self.server_addresses:
-                    self.server_handles.append(server_handle)
-                    self.server_addresses.append(server_address)
+                endpoints = replica.get_request_server_endpoints()
+                for server_address, server_handle in endpoints:
+                    if server_address not in self.server_addresses:
+                        self.server_handles.append(server_handle)
+                        self.server_addresses.append(server_address)
                 if replica not in self.rollout_replicas:
                     self.rollout_replicas.append(replica)
                 self.alive_replicas[rid] = replica
-                self.alive_addresses[rid] = server_address
+                self.alive_addresses[rid] = endpoints[0][0]
+                self.alive_server_ids[rid] = [address for address, _ in endpoints]
 
             self.last_hybrid_add_time = time.time()
 
@@ -223,7 +226,7 @@ class FullyAsyncLLMServerManager(LLMServerManager):
             if rid not in self.alive_replicas:
                 logger.warning("[FullyAsyncLLMServerManager] Replica '%s' not active, skipping", rid)
                 continue
-            server_ids_to_remove.append(self.alive_addresses[rid])
+            server_ids_to_remove.extend(self.alive_server_ids[rid])
             valid_resource_ids.append(rid)
 
         if not server_ids_to_remove:
@@ -235,16 +238,17 @@ class FullyAsyncLLMServerManager(LLMServerManager):
 
             # Clean up local tracking lists.
             for rid in valid_resource_ids:
-                server_address = self.alive_addresses[rid]
                 replica = self.alive_replicas[rid]
-                if server_address in self.server_addresses:
-                    idx = self.server_addresses.index(server_address)
-                    self.server_addresses.pop(idx)
-                    self.server_handles.pop(idx)
+                for server_address in self.alive_server_ids[rid]:
+                    if server_address in self.server_addresses:
+                        idx = self.server_addresses.index(server_address)
+                        self.server_addresses.pop(idx)
+                        self.server_handles.pop(idx)
                 if replica in self.rollout_replicas:
                     self.rollout_replicas.remove(replica)
                 self.alive_replicas.pop(rid)
                 self.alive_addresses.pop(rid)
+                self.alive_server_ids.pop(rid)
 
             self.last_hybrid_remove_time = time.time()
 
