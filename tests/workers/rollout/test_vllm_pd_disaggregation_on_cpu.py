@@ -523,6 +523,7 @@ class _DispatchStub:
         self._pd_routing_request_count = 0
         self._pd_routing_selected_counts = []
         self._pd_routing_log_every = 0
+        self._pd_timing_log_every = 0
         self.replica_rank = 0
 
     def _select_decode_peer(self, routing_key, prompt_ids):

@@ -258,19 +258,10 @@ class vLLMPDReplica(vLLMReplica):
                     return_exceptions=True,
                 )
 
-        decode_addresses = await asyncio.gather(
-            *[server.get_server_address.remote() for server in self._decode_servers]
-        )
-        decode_peer_ids = [
-            f"http://[{host}]:{port}" if is_valid_ipv6_address(host) else f"http://{host}:{port}"
-            for host, port in decode_addresses
-        ]
         await asyncio.gather(
             *[
                 prefill_server.set_pd_peer.remote(
                     decode_peers=self._decode_servers,
-                    decode_peer_ids=decode_peer_ids,
-                    prefill_side_channel_host=prefill_side_channel_hosts[index],
                     prefill_side_channel_port=prefill_side_channel_ports[index],
                     prefill_engine_id=prefill_engine_ids[index],
                 )

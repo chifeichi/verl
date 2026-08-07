@@ -270,8 +270,6 @@ class vLLMHttpServer:
     async def set_pd_peer(
         self,
         decode_peers: list,
-        decode_peer_ids: list[str],
-        prefill_side_channel_host: str,
         prefill_side_channel_port: int,
         prefill_engine_id: str,
     ) -> None:
@@ -279,10 +277,18 @@ class vLLMHttpServer:
             f"set_pd_peer must be called on the prefill server (got role={self._disaggregation_role!r})"
         )
         assert isinstance(decode_peers, list) and decode_peers, "decode_peers must be a non-empty list"
-        if len(decode_peer_ids) != len(decode_peers):
-            raise ValueError("decode_peer_ids must have one stable identity per decode peer")
         self._pd_decode_peers = list(decode_peers)
-        self._pd_prefill_side_channel_host = prefill_side_channel_host
+        decode_addresses = await asyncio.gather(
+            *[decode_peer.get_server_address.remote() for decode_peer in decode_peers]
+        )
+        decode_peer_ids = [
+            f"http://[{host}]:{port}" if is_valid_ipv6_address(host) else f"http://{host}:{port}"
+            for host, port in decode_addresses
+        ]
+        self._pd_prefill_side_channel_host = os.environ.get(
+            "VLLM_NIXL_SIDE_CHANNEL_HOST",
+            self._server_address,
+        )
         self._pd_prefill_side_channel_port = prefill_side_channel_port
         self._pd_prefill_engine_id = prefill_engine_id
         self._pd_decode_selector = DecodePeerSelector(
