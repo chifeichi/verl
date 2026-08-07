@@ -518,8 +518,6 @@ class _DispatchStub:
         self._pd_prefill_engine_id = "eid-prefill"
         self._pd_prefill_side_channel_host = "127.0.0.1"
         self._pd_prefill_side_channel_port = 5559
-        self._pd_metaserver_base_url = "http://127.0.0.1:8000/verl/pd/metaserver"
-        self._pd_layerwise_meta_futures = {}
         self._pd_routing_request_count = 0
         self._pd_routing_selected_counts = []
         self._pd_routing_log_every = 0
@@ -534,11 +532,6 @@ class _DispatchStub:
         from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
         return vLLMHttpServer._select_decode_peer(self, routing_key, prompt_ids)
-
-    async def _pd_dispatch_ascend_layerwise(self, **kwargs):
-        from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
-
-        return await vLLMHttpServer._pd_dispatch_ascend_layerwise(self, **kwargs)
 
 
 def _import_http_server():
@@ -694,51 +687,6 @@ async def test_pd_dispatch_mooncake_constructs_decode_kv_params_locally():
     )
     # transfer_id must match across legs so prefill and decode rendezvous.
     assert dkv["transfer_id"] == transfer_id
-
-
-@pytest.mark.asyncio
-async def test_pd_dispatch_ascend_layerwise_starts_decode_before_prefill():
-    from unittest.mock import MagicMock
-
-    from verl.workers.rollout.replica import TokenOutput
-
-    server_cls = _import_http_server()
-    decode_peer = MagicMock()
-    events = []
-    stub = _DispatchStub(decode_peers=[decode_peer], connector="MooncakeLayerwiseConnector")
-
-    def start_decode(prompt_ids, sampling_params, request_id, **kwargs):
-        events.append("decode_start")
-        transfer_id = kwargs["kv_transfer_params"]["metaserver"].rsplit("/", 1)[-1]
-        metadata = {"do_remote_decode": True, "do_remote_prefill": False, "transfer_id": transfer_id}
-        asyncio.get_running_loop().call_soon(stub._pd_layerwise_meta_futures[transfer_id].set_result, metadata)
-        return _make_awaitable_token_output([7, 8])
-
-    decode_peer.generate.remote = MagicMock(side_effect=start_decode)
-    decode_peer.abort_request.remote = MagicMock()
-    captured_prefill = []
-
-    async def fake_generate(prompt_ids, sampling_params, request_id, **kwargs):
-        events.append("prefill")
-        captured_prefill.append((sampling_params, request_id, kwargs["kv_transfer_params"]))
-        return TokenOutput(token_ids=[42], stop_reason="completed")
-
-    stub.generate = fake_generate
-    result = await server_cls._pd_dispatch(
-        stub,
-        prompt_ids=[1, 2, 3],
-        sampling_params={"max_tokens": 16, "temperature": 0.0},
-        request_id="req-layerwise",
-    )
-
-    assert events == ["decode_start", "prefill"]
-    assert result.token_ids == [7, 8]
-    assert captured_prefill[0][0]["max_tokens"] == 1
-    assert captured_prefill[0][1] == "req-layerwise"
-    assert captured_prefill[0][2]["do_remote_decode"] is True
-    decode_peer.abort_request.remote.assert_not_called()
-    assert stub._pd_layerwise_meta_futures == {}
-    assert stub._pd_decode_selector.pending_requests == [0]
 
 
 @pytest.mark.asyncio

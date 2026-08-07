@@ -26,7 +26,6 @@ from typing import Any, Callable, Optional
 
 import ray
 import vllm.entrypoints.cli.serve
-from fastapi import Request
 from packaging import version
 from ray.actor import ActorHandle
 from vllm import SamplingParams
@@ -151,8 +150,6 @@ class vLLMHttpServer:
         self._pd_prefill_side_channel_port: Optional[int] = None
         self._pd_prefill_engine_id: Optional[str] = None
         self._pd_decode_selector: Optional[DecodePeerSelector] = None
-        self._pd_metaserver_base_url: Optional[str] = None
-        self._pd_layerwise_meta_futures: dict[str, asyncio.Future] = {}
         self._pd_routing_request_count = 0
         self._pd_routing_selected_counts: list[int] = []
         try:
@@ -297,12 +294,6 @@ class vLLMHttpServer:
             peer_ids=decode_peer_ids,
         )
         self._pd_routing_selected_counts = [0] * len(decode_peers)
-        connector = (self._disaggregation_kv_transfer_config or {}).get("kv_connector", "")
-        if connector == "MooncakeLayerwiseConnector":
-            if self._server_port is None:
-                raise RuntimeError("cannot configure Ascend PD before the prefill HTTP server starts")
-            host = f"[{self._server_address}]" if is_valid_ipv6_address(self._server_address) else self._server_address
-            self._pd_metaserver_base_url = f"http://{host}:{self._server_port}/verl/pd/metaserver"
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
         if self.node_rank != 0:
@@ -542,21 +533,6 @@ class vLLMHttpServer:
         if "model_config" in build_app_sig.parameters:
             build_app_kwargs["model_config"] = engine_client.model_config
         app = build_app(args, **build_app_kwargs)
-        if (
-            self._disaggregation_role == "prefill"
-            and (self._disaggregation_kv_transfer_config or {}).get("kv_connector")
-            == "MooncakeLayerwiseConnector"
-        ):
-
-            @app.post("/verl/pd/metaserver/{transfer_id}")
-            async def _receive_layerwise_metadata(transfer_id: str, request: Request):
-                future = self._pd_layerwise_meta_futures.get(transfer_id)
-                if future is None:
-                    return {"accepted": False, "reason": "unknown or expired transfer_id"}
-                if not future.done():
-                    future.set_result(await request.json())
-                return {"accepted": True}
-
         init_app_sig = inspect.signature(init_app_state)
         if "vllm_config" in init_app_sig.parameters:
             await init_app_state(engine_client, vllm_config, app.state, args)
@@ -848,19 +824,6 @@ class vLLMHttpServer:
             )
         try:
             connector = (self._disaggregation_kv_transfer_config or {}).get("kv_connector", "")
-            if connector == "MooncakeLayerwiseConnector":
-                result = await self._pd_dispatch_ascend_layerwise(
-                    prompt_ids=prompt_ids,
-                    sampling_params=sampling_params,
-                    request_id=request_id,
-                    decode_peer=decode_peer,
-                    image_data=image_data,
-                    video_data=video_data,
-                    audio_data=audio_data,
-                    mm_processor_kwargs=mm_processor_kwargs,
-                    priority=priority,
-                )
-                return result
             if connector == "MooncakeConnectorV1":
                 if not self._pd_timing_config_logged:
                     print(
@@ -997,146 +960,6 @@ class vLLMHttpServer:
                         separators=(",", ":"),
                         sort_keys=True,
                     ),
-                )
-
-    async def _pd_dispatch_ascend_layerwise(
-        self,
-        prompt_ids: list[int],
-        sampling_params: dict[str, Any],
-        request_id: str,
-        decode_peer: ActorHandle,
-        image_data: Optional[list[Any]] = None,
-        video_data: Optional[list[Any]] = None,
-        audio_data: Optional[list[Any]] = None,
-        mm_processor_kwargs: Optional[dict[str, Any]] = None,
-        priority: int = 0,
-    ) -> TokenOutput:
-        """Coordinate vLLM-Ascend's decode-first layerwise KV transfer."""
-        if self._pd_metaserver_base_url is None:
-            raise RuntimeError("Ascend PD metaserver is unavailable before the prefill HTTP server starts")
-
-        if not self._pd_timing_config_logged:
-            print(
-                f"[VERL_PD_TIMING_CONFIG] pid={os.getpid()} "
-                f"replica_rank={self.replica_rank} log_every={self._pd_timing_log_every}",
-                flush=True,
-            )
-            self._pd_timing_config_logged = True
-        timing_enabled = (
-            self._pd_timing_log_every > 0
-            and int.from_bytes(hashlib.sha256(request_id.encode()).digest()[:8], "big") % self._pd_timing_log_every == 0
-        )
-        dispatch_started_at = time.perf_counter() if timing_enabled else 0.0
-        metadata_received_at: float | None = None
-        prefill_finished_at: float | None = None
-        decode_finished_at: float | None = None
-        decode_result_value: TokenOutput | None = None
-        error_type: str | None = None
-        transfer_id = uuid.uuid4().hex
-        metadata_future = asyncio.get_running_loop().create_future()
-        self._pd_layerwise_meta_futures[transfer_id] = metadata_future
-        decode_kv_params = {
-            "do_remote_decode": False,
-            "do_remote_prefill": True,
-            "metaserver": f"{self._pd_metaserver_base_url}/{transfer_id}",
-        }
-
-        metadata_wait: asyncio.Task | None = None
-        try:
-            decode_result_ref = decode_peer.generate.remote(
-                prompt_ids,
-                dict(sampling_params),
-                request_id,
-                image_data=image_data,
-                video_data=video_data,
-                audio_data=audio_data,
-                mm_processor_kwargs=mm_processor_kwargs,
-                priority=priority,
-                kv_transfer_params=decode_kv_params,
-            )
-            decode_result = asyncio.ensure_future(decode_result_ref)
-            timeout_s = float(os.environ.get("VERL_PD_METASERVER_TIMEOUT_S", "300"))
-            metadata_wait = asyncio.create_task(asyncio.wait_for(metadata_future, timeout=timeout_s))
-            completed, _ = await asyncio.wait(
-                (metadata_wait, decode_result),
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if decode_result in completed:
-                decode_result.result()
-                raise RuntimeError(
-                    "Decode completed before producing layerwise metadata "
-                    f"(request_id={request_id}, transfer_id={transfer_id})"
-                )
-            prefill_kv_params = metadata_wait.result()
-            if timing_enabled:
-                metadata_received_at = time.perf_counter()
-            prefill_sp = dict(sampling_params)
-            prefill_sp.pop("max_tokens", None)
-            prefill_sp.pop("max_new_tokens", None)
-            prefill_sp["max_tokens"] = 1
-            await self.generate(
-                prompt_ids,
-                prefill_sp,
-                request_id,
-                image_data=image_data,
-                video_data=video_data,
-                audio_data=audio_data,
-                mm_processor_kwargs=mm_processor_kwargs,
-                priority=priority,
-                kv_transfer_params=prefill_kv_params,
-            )
-            if timing_enabled:
-                prefill_finished_at = time.perf_counter()
-            decode_result_value = await decode_result
-            if timing_enabled:
-                decode_finished_at = time.perf_counter()
-            return decode_result_value
-        except BaseException as exc:
-            error_type = type(exc).__name__
-            try:
-                await decode_peer.abort_request.remote(request_id, reset_prefix_cache=False)
-            except Exception:
-                logger.exception("Failed to abort layerwise decode request %s after PD dispatch failed", request_id)
-            raise
-        finally:
-            if metadata_wait is not None and not metadata_wait.done():
-                metadata_wait.cancel()
-            self._pd_layerwise_meta_futures.pop(transfer_id, None)
-            if timing_enabled:
-                finished_at = decode_finished_at or time.perf_counter()
-                print(
-                    "[VERL_PD_TIMING] "
-                    + json.dumps(
-                        {
-                            "request_id": request_id,
-                            "replica_rank": self.replica_rank,
-                            "prompt_tokens": len(prompt_ids),
-                            "output_tokens": (
-                                len(decode_result_value.token_ids) if decode_result_value is not None else None
-                            ),
-                            "d_metadata_ms": (
-                                round((metadata_received_at - dispatch_started_at) * 1000, 3)
-                                if metadata_received_at is not None
-                                else None
-                            ),
-                            "p_prefill_transfer_ms": (
-                                round((prefill_finished_at - metadata_received_at) * 1000, 3)
-                                if prefill_finished_at is not None and metadata_received_at is not None
-                                else None
-                            ),
-                            "d_tail_ms": (
-                                round((decode_finished_at - prefill_finished_at) * 1000, 3)
-                                if decode_finished_at is not None and prefill_finished_at is not None
-                                else None
-                            ),
-                            "total_ms": round((finished_at - dispatch_started_at) * 1000, 3),
-                            "status": "error" if error_type is not None else "completed",
-                            "error_type": error_type,
-                        },
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    ),
-                    flush=True,
                 )
 
     async def wake_up(self, tags: list[str] | None = None):
