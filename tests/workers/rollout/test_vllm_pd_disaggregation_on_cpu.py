@@ -211,7 +211,7 @@ def _build_kv_cfg(
     engine_id: str = "test-eid",
     transfer_backend: str = "nixl",
     mooncake_protocol=None,
-    use_ascend_layerwise: bool = False,
+    use_ascend_mooncake_v1: bool = False,
     kv_port=None,
     prefill_tp=None,
     decode_tp=None,
@@ -225,7 +225,7 @@ def _build_kv_cfg(
         engine_id=engine_id,
         transfer_backend=transfer_backend,
         mooncake_protocol=mooncake_protocol,
-        use_ascend_layerwise=use_ascend_layerwise,
+        use_ascend_mooncake_v1=use_ascend_mooncake_v1,
         kv_port=kv_port,
         prefill_tp=prefill_tp,
         decode_tp=decode_tp,
@@ -282,16 +282,16 @@ def test_build_kv_transfer_config_mooncake_protocol_ignored_for_nixl():
 
 
 @pytest.mark.parametrize("role,expected_role", [("prefill", "kv_producer"), ("decode", "kv_consumer")])
-def test_build_kv_transfer_config_ascend_layerwise(role, expected_role):
+def test_build_kv_transfer_config_ascend_mooncake_v1(role, expected_role):
     cfg = _build_kv_cfg(
         role=role,
         transfer_backend="mooncake",
-        use_ascend_layerwise=True,
+        use_ascend_mooncake_v1=True,
         kv_port=19001,
         prefill_tp=4,
         decode_tp=2,
     )
-    assert cfg["kv_connector"] == "MooncakeLayerwiseConnector"
+    assert cfg["kv_connector"] == "MooncakeConnectorV1"
     assert cfg["kv_role"] == expected_role
     assert cfg["kv_port"] == 19001
     assert cfg["kv_connector_extra_config"] == {
@@ -300,12 +300,12 @@ def test_build_kv_transfer_config_ascend_layerwise(role, expected_role):
     }
 
 
-def test_build_kv_transfer_config_ascend_layerwise_requires_topology():
+def test_build_kv_transfer_config_ascend_mooncake_v1_requires_topology():
     with pytest.raises(ValueError, match="requires kv_port, prefill_tp, and decode_tp"):
         _build_kv_cfg(
             role="prefill",
             transfer_backend="mooncake",
-            use_ascend_layerwise=True,
+            use_ascend_mooncake_v1=True,
         )
 
 
@@ -578,8 +578,7 @@ def test_select_decode_peer_distribution_balanced_at_32_with_3_peers():
 
 @pytest.mark.asyncio
 async def test_pd_dispatch_routes_prefill_leg_then_decode_peer():
-    """End-to-end shape of ``_pd_dispatch``: prefill leg sets max_tokens=1 +
-    do_remote_decode, decode leg gets the prefill's kv_transfer_params."""
+    """MooncakeConnectorV1 returns decode params from the prefill leg."""
     from unittest.mock import MagicMock
 
     server_cls = _import_http_server()
@@ -591,7 +590,7 @@ async def test_pd_dispatch_routes_prefill_leg_then_decode_peer():
     decode_peer.generate.remote = MagicMock(return_value=_make_awaitable_token_output(expected_decode_token_ids))
 
     # Stub server.generate: returns a TokenOutput with kv_transfer_params in
-    # extra_fields, simulating the response NixlConnector populates.
+    # extra_fields, matching MooncakeConnectorV1.request_finished().
     server_decode_kv = {
         "do_remote_prefill": True,
         "remote_engine_id": "eid-prefill",
@@ -613,7 +612,7 @@ async def test_pd_dispatch_routes_prefill_leg_then_decode_peer():
             extra_fields={"kv_transfer_params": server_decode_kv},
         )
 
-    stub = _DispatchStub(decode_peers=[decode_peer])
+    stub = _DispatchStub(decode_peers=[decode_peer], connector="MooncakeConnectorV1")
     stub.generate = fake_generate
 
     result = await server_cls._pd_dispatch(

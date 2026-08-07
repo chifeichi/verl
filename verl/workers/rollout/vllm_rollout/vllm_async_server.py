@@ -816,6 +816,10 @@ class vLLMHttpServer:
         started_at = time.perf_counter() if should_log else 0.0
         result: Optional[TokenOutput] = None
         error_type: Optional[str] = None
+        v1_timing_enabled = False
+        v1_dispatch_started_at = 0.0
+        v1_prefill_finished_at: float | None = None
+        v1_decode_finished_at: float | None = None
         if should_log:
             pending_after_select = list(self._pd_decode_selector.pending_requests)
             pending_before_select = list(pending_after_select)
@@ -857,6 +861,22 @@ class vLLMHttpServer:
                     priority=priority,
                 )
                 return result
+            if connector == "MooncakeConnectorV1":
+                if not self._pd_timing_config_logged:
+                    print(
+                        f"[VERL_PD_TIMING_CONFIG_V1] pid={os.getpid()} "
+                        f"replica_rank={self.replica_rank} log_every={self._pd_timing_log_every}",
+                        flush=True,
+                    )
+                    self._pd_timing_config_logged = True
+                v1_timing_enabled = (
+                    self._pd_timing_log_every > 0
+                    and int.from_bytes(hashlib.sha256(request_id.encode()).digest()[:8], "big")
+                    % self._pd_timing_log_every
+                    == 0
+                )
+                if v1_timing_enabled:
+                    v1_dispatch_started_at = time.perf_counter()
             is_mooncake = connector == "MooncakeConnector"
 
             # Prefill only materializes KV; discard its single generated token.
@@ -882,6 +902,8 @@ class vLLMHttpServer:
                 priority=priority,
                 kv_transfer_params=prefill_kv_params,
             )
+            if v1_timing_enabled:
+                v1_prefill_finished_at = time.perf_counter()
             if is_mooncake:
                 # Mooncake does not return decode params from the prefill leg.
                 if self._pd_prefill_side_channel_host is None:
@@ -914,12 +936,43 @@ class vLLMHttpServer:
                 priority=priority,
                 kv_transfer_params=decode_kv_params,
             )
+            if v1_timing_enabled:
+                v1_decode_finished_at = time.perf_counter()
             return result
         except BaseException as exc:
             error_type = type(exc).__name__
             raise
         finally:
             self._pd_decode_selector.release(decode_peer_index)
+            if v1_timing_enabled:
+                finished_at = v1_decode_finished_at or time.perf_counter()
+                print(
+                    "[VERL_PD_TIMING_V1] "
+                    + json.dumps(
+                        {
+                            "request_id": request_id,
+                            "replica_rank": self.replica_rank,
+                            "prompt_tokens": len(prompt_ids),
+                            "output_tokens": len(result.token_ids) if result is not None else None,
+                            "p_prefill_ms": (
+                                round((v1_prefill_finished_at - v1_dispatch_started_at) * 1000, 3)
+                                if v1_prefill_finished_at is not None
+                                else None
+                            ),
+                            "d_transfer_decode_ms": (
+                                round((v1_decode_finished_at - v1_prefill_finished_at) * 1000, 3)
+                                if v1_decode_finished_at is not None and v1_prefill_finished_at is not None
+                                else None
+                            ),
+                            "total_ms": round((finished_at - v1_dispatch_started_at) * 1000, 3),
+                            "status": "error" if error_type is not None else "completed",
+                            "error_type": error_type,
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
             if should_log:
                 logger.info(
                     "[VERL_PD_ROUTING] %s",

@@ -119,12 +119,12 @@ class vLLMPDReplica(vLLMReplica):
         assert len(self.workers) == self.world_size, (
             f"worker count {len(self.workers)} != PD world size {self.world_size}"
         )
-        use_ascend_layerwise = is_torch_npu_available(check_device=False)
+        use_ascend_mooncake_v1 = is_torch_npu_available(check_device=False)
         transfer_backend = self.config.disaggregation.transfer_backend
-        if use_ascend_layerwise and transfer_backend == "nixl":
+        if use_ascend_mooncake_v1 and transfer_backend == "nixl":
             logger.warning(
                 "NixlConnector is not supported for Ascend PD; falling back to "
-                "MooncakeLayerwiseConnector"
+                "MooncakeConnectorV1"
             )
             transfer_backend = "mooncake"
 
@@ -180,7 +180,7 @@ class vLLMPDReplica(vLLMReplica):
                     engine_id=prefill_engine_id,
                     transfer_backend=transfer_backend,
                     mooncake_protocol=self.config.disaggregation.mooncake_protocol,
-                    use_ascend_layerwise=use_ascend_layerwise,
+                    use_ascend_mooncake_v1=use_ascend_mooncake_v1,
                     kv_port=prefill_side_channel_port,
                     prefill_tp=self._prefill_tp,
                     decode_tp=self._decode_tp,
@@ -220,7 +220,7 @@ class vLLMPDReplica(vLLMReplica):
                     engine_id=uuid.uuid4().hex,
                     transfer_backend=transfer_backend,
                     mooncake_protocol=self.config.disaggregation.mooncake_protocol,
-                    use_ascend_layerwise=use_ascend_layerwise,
+                    use_ascend_mooncake_v1=use_ascend_mooncake_v1,
                     kv_port=decode_side_channel_port,
                     prefill_tp=self._prefill_tp,
                     decode_tp=self._decode_tp,
@@ -303,7 +303,7 @@ class vLLMPDReplica(vLLMReplica):
         engine_id: str,
         transfer_backend: str,
         mooncake_protocol: Optional[str] = None,
-        use_ascend_layerwise: bool = False,
+        use_ascend_mooncake_v1: bool = False,
         kv_port: Optional[int] = None,
         prefill_tp: Optional[int] = None,
         decode_tp: Optional[int] = None,
@@ -313,14 +313,14 @@ class vLLMPDReplica(vLLMReplica):
             "prefill": "kv_producer",
             "decode": "kv_consumer",
         }
-        if use_ascend_layerwise:
+        if use_ascend_mooncake_v1:
             if transfer_backend != "mooncake":
                 raise ValueError("Ascend PD requires transfer_backend='mooncake'")
             if kv_port is None or prefill_tp is None or decode_tp is None:
                 raise ValueError(
-                    "MooncakeLayerwiseConnector requires kv_port, prefill_tp, and decode_tp"
+                    "MooncakeConnectorV1 requires kv_port, prefill_tp, and decode_tp"
                 )
-            connector = "MooncakeLayerwiseConnector"
+            connector = "MooncakeConnectorV1"
         else:
             connector = {
                 "nixl": "NixlConnector",
@@ -332,7 +332,7 @@ class vLLMPDReplica(vLLMReplica):
             "engine_id": engine_id,
             "kv_buffer_device": get_device_name(),
         }
-        if use_ascend_layerwise:
+        if use_ascend_mooncake_v1:
             cfg["kv_port"] = kv_port
             cfg["kv_connector_extra_config"] = {
                 "prefill": {"dp_size": 1, "tp_size": prefill_tp},
