@@ -165,6 +165,7 @@ class vLLMHttpServer:
         except ValueError:
             self._pd_timing_log_every = 0
             logger.warning("Ignoring invalid VERL_PD_TIMING_LOG_EVERY; PD timing trace is disabled")
+        self._pd_timing_config_logged = False
 
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
         os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
@@ -961,6 +962,13 @@ class vLLMHttpServer:
         if self._pd_metaserver_base_url is None:
             raise RuntimeError("Ascend PD metaserver is unavailable before the prefill HTTP server starts")
 
+        if not self._pd_timing_config_logged:
+            print(
+                f"[VERL_PD_TIMING_CONFIG] pid={os.getpid()} "
+                f"replica_rank={self.replica_rank} log_every={self._pd_timing_log_every}",
+                flush=True,
+            )
+            self._pd_timing_config_logged = True
         timing_enabled = (
             self._pd_timing_log_every > 0
             and int.from_bytes(hashlib.sha256(request_id.encode()).digest()[:8], "big") % self._pd_timing_log_every == 0
@@ -1043,9 +1051,9 @@ class vLLMHttpServer:
             self._pd_layerwise_meta_futures.pop(transfer_id, None)
             if timing_enabled:
                 finished_at = decode_finished_at or time.perf_counter()
-                logger.info(
-                    "[VERL_PD_TIMING] %s",
-                    json.dumps(
+                print(
+                    "[VERL_PD_TIMING] "
+                    + json.dumps(
                         {
                             "request_id": request_id,
                             "replica_rank": self.replica_rank,
@@ -1075,6 +1083,7 @@ class vLLMHttpServer:
                         separators=(",", ":"),
                         sort_keys=True,
                     ),
+                    flush=True,
                 )
 
     async def wake_up(self, tags: list[str] | None = None):
