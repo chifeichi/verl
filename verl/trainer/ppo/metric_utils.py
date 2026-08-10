@@ -92,6 +92,22 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
     )
 
 
+def compute_length_metrics(batch: DataProto) -> dict[str, float]:
+    """Compute prompt and response length statistics for a rollout batch."""
+    response_info = _compute_response_info(batch)
+    prompt_length = response_info["prompt_length"]
+    response_length = response_info["response_length"]
+
+    return {
+        "prompt_length/mean": torch.mean(prompt_length).detach().item(),
+        "prompt_length/max": torch.max(prompt_length).detach().item(),
+        "prompt_length/min": torch.min(prompt_length).detach().item(),
+        "response_length/mean": torch.mean(response_length).detach().item(),
+        "response_length/max": torch.max(response_length).detach().item(),
+        "response_length/min": torch.min(response_length).detach().item(),
+    }
+
+
 def _get_nested_attr(obj: Any, name: str) -> Any:
     if hasattr(obj, "get"):
         return obj.get(name)
