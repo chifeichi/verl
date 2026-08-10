@@ -23,7 +23,7 @@ import logging
 import os
 import uuid
 from dataclasses import replace as _dc_replace
-from typing import Optional
+from typing import Any, Optional
 
 import ray
 from ray.actor import ActorHandle
@@ -114,6 +114,7 @@ class vLLMPDReplica(vLLMReplica):
         self._prefill_servers: list[ActorHandle] = []
         self._decode_servers: list[ActorHandle] = []
         self._prefill_server_addresses: list[str] = []
+        self._decode_server_addresses: list[str] = []
 
     async def launch_servers(self):
         assert len(self.workers) == self.world_size, (
@@ -273,18 +274,25 @@ class vLLMPDReplica(vLLMReplica):
         prefill_addresses = await asyncio.gather(
             *[server.get_server_address.remote() for server in self._prefill_servers]
         )
+        decode_addresses = await asyncio.gather(
+            *[server.get_server_address.remote() for server in self._decode_servers]
+        )
         self._prefill_server_addresses = [
             f"[{host}]:{port}" if is_valid_ipv6_address(host) else f"{host}:{port}"
             for host, port in prefill_addresses
+        ]
+        self._decode_server_addresses = [
+            f"[{host}]:{port}" if is_valid_ipv6_address(host) else f"{host}:{port}"
+            for host, port in decode_addresses
         ]
         self._server_handle = self._prefill_servers[0]
         self._server_address = self._prefill_server_addresses[0]
 
         logger.info(
-            "vLLMPDReplica rank=%s launched: prefills=%s, decodes=%d",
+            "vLLMPDReplica rank=%s launched: prefills=%s, decodes=%s",
             self.replica_rank,
             self._prefill_server_addresses,
-            len(self._decode_servers),
+            self._decode_server_addresses,
         )
 
     def get_request_server_endpoints(self) -> list[tuple[str, ActorHandle]]:
@@ -292,6 +300,29 @@ class vLLMPDReplica(vLLMReplica):
         if not self._prefill_servers or len(self._prefill_server_addresses) != len(self._prefill_servers):
             raise RuntimeError("PD prefill servers have not been launched")
         return list(zip(self._prefill_server_addresses, self._prefill_servers, strict=True))
+
+    def get_metrics_server_endpoints(self) -> list[tuple[str, dict[str, Any]]]:
+        """Expose all P/D vLLM metrics endpoints without changing request routing."""
+        if len(self._prefill_server_addresses) != len(self._prefill_servers):
+            raise RuntimeError("PD prefill metrics endpoints are not ready")
+        if len(self._decode_server_addresses) != len(self._decode_servers):
+            raise RuntimeError("PD decode metrics endpoints are not ready")
+        return [
+            *[
+                (
+                    address,
+                    {"request_endpoint": index, "pd_role": "prefill", "pd_index": index},
+                )
+                for index, address in enumerate(self._prefill_server_addresses)
+            ],
+            *[
+                (
+                    address,
+                    {"request_endpoint": -1, "pd_role": "decode", "pd_index": index},
+                )
+                for index, address in enumerate(self._decode_server_addresses)
+            ],
+        ]
 
     @staticmethod
     def _collect_cuda_devices(worker_infos) -> str:

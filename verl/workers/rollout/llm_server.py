@@ -542,6 +542,17 @@ class LLMServerManager:
         self.server_handles = [handle for _, _, _, handle in request_endpoints]
         print(f"LLMServerManager: {self.server_addresses}")
 
+        metrics_endpoints = [
+            (replica, address, endpoint_labels)
+            for replica in self.rollout_replicas
+            for address, endpoint_labels in replica.get_metrics_server_endpoints()
+        ]
+        metrics_addresses = [address for _, address, _ in metrics_endpoints]
+        metrics_labels = [
+            {"replica": replica.replica_rank, **endpoint_labels}
+            for replica, _, endpoint_labels in metrics_endpoints
+        ]
+
         # Update Prometheus / rl-insight metrics with server addresses
         needs_metrics = self.rollout_config.prometheus.enable or RLInsightLogger.enabled()
         if self.rollout_config.disable_log_stats:
@@ -550,16 +561,13 @@ class LLMServerManager:
         if not self.rollout_config.disable_log_stats:
             if self.rollout_config.prometheus.enable:
                 update_prometheus_config(
-                    self.rollout_config.prometheus, self.server_addresses, self.rollout_config.name
+                    self.rollout_config.prometheus, metrics_addresses, self.rollout_config.name
                 )
             if RLInsightLogger.enabled():
                 RLInsightLogger.register_rollout_metrics(
-                    self.server_addresses,
+                    metrics_addresses,
                     self.rollout_config.name,
-                    labels=[
-                        {"replica": replica.replica_rank, "request_endpoint": endpoint_index}
-                        for replica, endpoint_index, _, _ in request_endpoints
-                    ],
+                    labels=metrics_labels,
                 )
 
     async def _init_global_load_balancer(self) -> None:

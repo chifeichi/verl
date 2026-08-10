@@ -478,6 +478,34 @@ def test_pd_replica_exposes_every_prefill_as_request_endpoint(patched_replica_cl
     ]
 
 
+def test_pd_replica_exposes_all_prefill_and_decode_metrics_endpoints(patched_replica_cls):
+    cfg = _make_pd_config(prefill_replicas=2, decode_replicas=2)
+    replica = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+    replica._prefill_servers = [object(), object()]
+    replica._decode_servers = [object(), object()]
+    replica._prefill_server_addresses = ["p0:8000", "p1:8000"]
+    replica._decode_server_addresses = ["d0:8000", "d1:8000"]
+
+    assert replica.get_metrics_server_endpoints() == [
+        (
+            "p0:8000",
+            {"request_endpoint": 0, "pd_role": "prefill", "pd_index": 0},
+        ),
+        (
+            "p1:8000",
+            {"request_endpoint": 1, "pd_role": "prefill", "pd_index": 1},
+        ),
+        (
+            "d0:8000",
+            {"request_endpoint": -1, "pd_role": "decode", "pd_index": 0},
+        ),
+        (
+            "d1:8000",
+            {"request_endpoint": -1, "pd_role": "decode", "pd_index": 1},
+        ),
+    ]
+
+
 def test_pd_replica_init_rejects_dp_gt_1(patched_replica_cls):
     cfg = _make_pd_config(data_parallel_size=2)
     with pytest.raises(NotImplementedError, match="data_parallel_size=1"):
