@@ -43,7 +43,6 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
-    compute_length_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
@@ -1506,19 +1505,6 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
-
-                    rollout_length_metrics = compute_length_metrics(batch)
-                    print(
-                        "[ROLLOUT_LENGTH] "
-                        f"step={self.global_steps} "
-                        f"prompt_length_mean={rollout_length_metrics['prompt_length/mean']:.3f} "
-                        f"prompt_length_max={rollout_length_metrics['prompt_length/max']:.0f} "
-                        f"prompt_length_min={rollout_length_metrics['prompt_length/min']:.0f} "
-                        f"response_length_mean={rollout_length_metrics['response_length/mean']:.3f} "
-                        f"response_length_max={rollout_length_metrics['response_length/max']:.0f} "
-                        f"response_length_min={rollout_length_metrics['response_length/min']:.0f}",
-                        flush=True,
-                    )
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),

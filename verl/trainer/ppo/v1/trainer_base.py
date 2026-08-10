@@ -475,6 +475,8 @@ class PPOTrainer(ABC):
             metrics.update(off_policy_metrics)
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
             self.on_sample_end()
+            if self.trainer_mode == "sync":
+                self._log_rollout_length_metrics(batch)
 
         # 2. [OPTIONAL] compute reward score with colocated reward model
         if self.reward_loop_manager.reward_loop_worker_handles is None:
@@ -513,6 +515,36 @@ class PPOTrainer(ABC):
                 batch = self._update_actor(batch, metrics=metrics)
 
         return batch
+
+    def _log_rollout_length_metrics(self, batch: KVBatchMeta) -> None:
+        data = tq.kv_batch_get(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            select_fields=["prompts", "responses"],
+        )
+        prompt_lengths = data["prompts"].offsets().diff().float()
+        response_lengths = data["responses"].offsets().diff().float()
+        non_padding_mask = torch.tensor(
+            [not tag.get("is_padding", False) for tag in batch.tags],
+            dtype=torch.bool,
+            device=prompt_lengths.device,
+        )
+        prompt_lengths = prompt_lengths[non_padding_mask]
+        response_lengths = response_lengths[non_padding_mask]
+        if prompt_lengths.numel() == 0:
+            return
+
+        print(
+            "[ROLLOUT_LENGTH] "
+            f"step={self.global_steps} "
+            f"prompt_length_mean={prompt_lengths.mean().item():.3f} "
+            f"prompt_length_max={prompt_lengths.max().item():.0f} "
+            f"prompt_length_min={prompt_lengths.min().item():.0f} "
+            f"response_length_mean={response_lengths.mean().item():.3f} "
+            f"response_length_max={response_lengths.max().item():.0f} "
+            f"response_length_min={response_lengths.min().item():.0f}",
+            flush=True,
+        )
 
     # ------------------------------ abstract methods ------------------------------
 
