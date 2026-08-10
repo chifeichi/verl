@@ -370,6 +370,9 @@ class vLLMPDReplica(vLLMReplica):
             "MC_TCP_ENABLE_CONNECTION_POOL": os.environ.get("MC_TCP_ENABLE_CONNECTION_POOL", "1"),
             "VERL_PD_ROUTING_LOG_EVERY": os.environ.get("VERL_PD_ROUTING_LOG_EVERY", "0"),
             "VERL_PD_TIMING_LOG_EVERY": os.environ.get("VERL_PD_TIMING_LOG_EVERY", "0"),
+            "VERL_PD_SCHEDULER_LOG_INTERVAL_SECS": os.environ.get(
+                "VERL_PD_SCHEDULER_LOG_INTERVAL_SECS", "0"
+            ),
             "VERL_ZMQ_BASE_TRAINER_RANK": str(zmq_base_trainer_rank),
             "VERL_RAY_JOB_ID": ray.get_runtime_context().get_job_id(),
         }
