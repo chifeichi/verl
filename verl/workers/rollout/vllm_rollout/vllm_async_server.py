@@ -147,12 +147,11 @@ class vLLMHttpServer:
         )
         self._pd_session_cache_history: dict[str, tuple[tuple[int, ...], int, int, int]] = {}
         if self._pd_session_cache_debug:
-            logger.warning(
-                "[VERL_PD_SESSION_CACHE_CONFIG] pid=%s replica_rank=%s role=%s log_every=%s",
-                os.getpid(),
-                replica_rank,
-                disaggregation_role,
-                self._pd_session_cache_log_every,
+            print(
+                f"[VERL_PD_SESSION_CACHE_CONFIG] pid={os.getpid()} "
+                f"replica_rank={replica_rank} role={disaggregation_role} "
+                f"log_every={self._pd_session_cache_log_every}",
+                flush=True,
             )
 
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
@@ -903,29 +902,20 @@ class vLLMHttpServer:
             )
             context_growth_tokens = max(prompt_tokens - len(previous_sequence), 0)
 
-        logger.warning(
-            "[VERL_PD_SESSION_CACHE] pid=%s replica_rank=%s session_id=%s "
-            "request_id=%s turn=%s prompt_tokens=%s p_cached_tokens=%s "
-            "p_computed_tokens=%s previous_prompt_tokens=%s previous_decode_tokens=%s "
-            "identical_previous_tokens=%s identical_previous_decode_tokens=%s "
-            "missing_identical_tokens=%s missing_identical_decode_tokens=%s "
-            "context_growth_tokens=%s current_decode_tokens=%s",
-            os.getpid(),
-            self.replica_rank,
-            routing_key,
-            request_id,
-            turn,
-            prompt_tokens,
-            cached_tokens,
-            max(prompt_tokens - cached_tokens, 0),
-            previous_prompt_tokens,
-            previous_decode_tokens,
-            identical_previous_tokens,
-            identical_previous_decode_tokens,
-            missing_identical_tokens,
-            missing_identical_decode_tokens,
-            context_growth_tokens,
-            decode_tokens,
+        print(
+            f"[VERL_PD_SESSION_CACHE] pid={os.getpid()} replica_rank={self.replica_rank} "
+            f"session_id={routing_key} request_id={request_id} turn={turn} "
+            f"prompt_tokens={prompt_tokens} p_cached_tokens={cached_tokens} "
+            f"p_computed_tokens={max(prompt_tokens - cached_tokens, 0)} "
+            f"previous_prompt_tokens={previous_prompt_tokens} "
+            f"previous_decode_tokens={previous_decode_tokens} "
+            f"identical_previous_tokens={identical_previous_tokens} "
+            f"identical_previous_decode_tokens={identical_previous_decode_tokens} "
+            f"missing_identical_tokens={missing_identical_tokens} "
+            f"missing_identical_decode_tokens={missing_identical_decode_tokens} "
+            f"context_growth_tokens={context_growth_tokens} "
+            f"current_decode_tokens={decode_tokens}",
+            flush=True,
         )
 
         history[routing_key] = (
