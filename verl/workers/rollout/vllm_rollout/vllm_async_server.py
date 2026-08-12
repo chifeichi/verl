@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import uuid
+import zlib
 from collections.abc import Sequence
 from pprint import pprint
 from typing import Any, Callable, Optional
@@ -140,6 +141,11 @@ class vLLMHttpServer:
         self._pd_prefill_side_channel_port: Optional[int] = None
         self._pd_prefill_engine_id: Optional[str] = None
         self._pd_decode_selector: Optional[DecodePeerSelector] = None
+        self._pd_session_cache_debug = os.getenv("VERL_PD_SESSION_CACHE_DEBUG", "0") == "1"
+        self._pd_session_cache_log_every = max(
+            1, int(os.getenv("VERL_PD_SESSION_CACHE_LOG_EVERY", "16"))
+        )
+        self._pd_session_cache_history: dict[str, tuple[tuple[int, ...], int, int, int]] = {}
 
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
         os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
@@ -808,7 +814,7 @@ class vLLMHttpServer:
                 if decode_kv_params is None:
                     raise RuntimeError(f"PD prefill leg returned no kv_transfer_params (request_id={request_id})")
 
-            return await decode_peer.generate.remote(
+            decode_out = await decode_peer.generate.remote(
                 prompt_ids,
                 dict(sampling_params),
                 f"{request_id}_D",
@@ -819,8 +825,107 @@ class vLLMHttpServer:
                 priority=priority,
                 kv_transfer_params=decode_kv_params,
             )
+            vLLMHttpServer._log_pd_session_cache(
+                self,
+                routing_key=effective_routing_key,
+                request_id=request_id,
+                prompt_ids=prompt_ids,
+                prefill_out=prefill_out,
+                decode_out=decode_out,
+            )
+            return decode_out
         finally:
             self._pd_decode_selector.release(decode_peer_index)
+
+    @staticmethod
+    def _common_prefix_length(left: Sequence[int], right: Sequence[int]) -> int:
+        limit = min(len(left), len(right))
+        for index in range(limit):
+            if left[index] != right[index]:
+                return index
+        return limit
+
+    def _log_pd_session_cache(
+        self,
+        *,
+        routing_key: str,
+        request_id: str,
+        prompt_ids: list[int],
+        prefill_out: TokenOutput,
+        decode_out: TokenOutput,
+    ) -> None:
+        if not getattr(self, "_pd_session_cache_debug", False):
+            return
+        log_every = max(1, getattr(self, "_pd_session_cache_log_every", 16))
+        if zlib.crc32(routing_key.encode("utf-8")) % log_every != 0:
+            return
+
+        cached_tokens = int(prefill_out.extra_fields.get("num_cached_tokens") or 0)
+        prompt_tokens = len(prompt_ids)
+        decode_tokens = len(decode_out.token_ids)
+        history = self._pd_session_cache_history
+        previous = history.get(routing_key)
+        turn = 1
+        previous_prompt_tokens = 0
+        previous_decode_tokens = 0
+        identical_previous_tokens = 0
+        identical_previous_decode_tokens = 0
+        missing_identical_tokens = 0
+        missing_identical_decode_tokens = 0
+        context_growth_tokens = 0
+
+        if previous is not None:
+            previous_sequence, previous_prompt_tokens, previous_decode_tokens, previous_turn = previous
+            turn = previous_turn + 1
+            identical_previous_tokens = self._common_prefix_length(prompt_ids, previous_sequence)
+            identical_previous_decode_tokens = max(
+                0,
+                min(
+                    identical_previous_tokens - previous_prompt_tokens,
+                    previous_decode_tokens,
+                ),
+            )
+            missing_identical_tokens = max(identical_previous_tokens - cached_tokens, 0)
+            cached_previous_decode_tokens = max(
+                0,
+                min(cached_tokens - previous_prompt_tokens, identical_previous_decode_tokens),
+            )
+            missing_identical_decode_tokens = (
+                identical_previous_decode_tokens - cached_previous_decode_tokens
+            )
+            context_growth_tokens = max(prompt_tokens - len(previous_sequence), 0)
+
+        logger.warning(
+            "[VERL_PD_SESSION_CACHE] pid=%s replica_rank=%s session_id=%s "
+            "request_id=%s turn=%s prompt_tokens=%s p_cached_tokens=%s "
+            "p_computed_tokens=%s previous_prompt_tokens=%s previous_decode_tokens=%s "
+            "identical_previous_tokens=%s identical_previous_decode_tokens=%s "
+            "missing_identical_tokens=%s missing_identical_decode_tokens=%s "
+            "context_growth_tokens=%s current_decode_tokens=%s",
+            os.getpid(),
+            self.replica_rank,
+            routing_key,
+            request_id,
+            turn,
+            prompt_tokens,
+            cached_tokens,
+            max(prompt_tokens - cached_tokens, 0),
+            previous_prompt_tokens,
+            previous_decode_tokens,
+            identical_previous_tokens,
+            identical_previous_decode_tokens,
+            missing_identical_tokens,
+            missing_identical_decode_tokens,
+            context_growth_tokens,
+            decode_tokens,
+        )
+
+        history[routing_key] = (
+            tuple(prompt_ids) + tuple(decode_out.token_ids),
+            prompt_tokens,
+            decode_tokens,
+            turn,
+        )
 
     async def wake_up(self, tags: list[str] | None = None):
         if self.node_rank != 0:
