@@ -146,6 +146,14 @@ class vLLMHttpServer:
             1, int(os.getenv("VERL_PD_SESSION_CACHE_LOG_EVERY", "16"))
         )
         self._pd_session_cache_history: dict[str, tuple[tuple[int, ...], int, int, int]] = {}
+        if self._pd_session_cache_debug:
+            logger.warning(
+                "[VERL_PD_SESSION_CACHE_CONFIG] pid=%s replica_rank=%s role=%s log_every=%s",
+                os.getpid(),
+                replica_rank,
+                disaggregation_role,
+                self._pd_session_cache_log_every,
+            )
 
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
         os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
@@ -1365,6 +1373,12 @@ class vLLMReplica(RolloutReplica):
                 **{var: "1" for var in get_platform().ray_noset_envvars()},
                 **get_platform().rollout_env_vars(),
             }
+            for var in (
+                "VERL_PD_SESSION_CACHE_DEBUG",
+                "VERL_PD_SESSION_CACHE_LOG_EVERY",
+            ):
+                if (value := os.getenv(var)) is not None:
+                    env_vars[var] = value
 
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
