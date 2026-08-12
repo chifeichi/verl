@@ -783,11 +783,21 @@ class vLLMHttpServer:
             prefill_sp.pop("max_new_tokens", None)
             prefill_sp["max_tokens"] = 1
             transfer_id = uuid.uuid4().hex
+            cache_debug_sampled = (
+                self._pd_session_cache_debug
+                and zlib.crc32(effective_routing_key.encode("utf-8"))
+                % self._pd_session_cache_log_every
+                == 0
+            )
             prefill_kv_params = {
                 "do_remote_decode": True,
                 "do_remote_prefill": False,
                 "transfer_id": transfer_id,
             }
+            if cache_debug_sampled:
+                prefill_kv_params["verl_pd_cache_debug"] = True
+                prefill_kv_params["verl_pd_session_id"] = effective_routing_key
+                prefill_kv_params["verl_pd_external_request_id"] = request_id
 
             prefill_out = await self.generate(
                 prompt_ids,
