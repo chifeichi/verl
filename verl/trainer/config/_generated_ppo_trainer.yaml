@@ -374,6 +374,8 @@ actor_rollout_ref:
       decode_policy:
         type: round_robin
       decode_tensor_model_parallel_size: null
+      prefill_gpu_memory_utilization: null
+      decode_gpu_memory_utilization: null
       transfer_backend: nixl
       bootstrap_port: null
       ib_device: null
@@ -758,6 +760,8 @@ reward:
         prefill_replicas: 1
         decode_replicas: 1
         decode_tensor_model_parallel_size: null
+        prefill_gpu_memory_utilization: null
+        decode_gpu_memory_utilization: null
         transfer_backend: nixl
         bootstrap_port: null
         ib_device: null

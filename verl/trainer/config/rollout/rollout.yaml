@@ -486,6 +486,10 @@ disaggregation:
   # Decode TP override; null = same as tensor_model_parallel_size.
   decode_tensor_model_parallel_size: null
 
+  # Per-role vLLM memory utilization overrides; null = use rollout.gpu_memory_utilization.
+  prefill_gpu_memory_utilization: null
+  decode_gpu_memory_utilization: null
+
   # KV cache transport: nixl | mooncake | ascend | mori | fake.
   transfer_backend: nixl
 

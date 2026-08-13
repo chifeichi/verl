@@ -342,6 +342,8 @@ def _make_pd_config(**overrides) -> RolloutConfig:
         decode_replicas=overrides.pop("decode_replicas", 1),
         transfer_backend=overrides.pop("transfer_backend", "nixl"),
         decode_tensor_model_parallel_size=overrides.pop("decode_tensor_model_parallel_size", None),
+        prefill_gpu_memory_utilization=overrides.pop("prefill_gpu_memory_utilization", None),
+        decode_gpu_memory_utilization=overrides.pop("decode_gpu_memory_utilization", None),
         ib_device=overrides.pop("ib_device", None),
     )
     return RolloutConfig(

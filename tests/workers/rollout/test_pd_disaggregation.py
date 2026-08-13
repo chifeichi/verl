@@ -28,6 +28,8 @@ def test_disaggregation_defaults_disabled_and_valid():
     assert cfg.transfer_backend == "nixl"
     assert cfg.bootstrap_port is None
     assert cfg.ib_device is None
+    assert cfg.prefill_gpu_memory_utilization is None
+    assert cfg.decode_gpu_memory_utilization is None
 
 
 def test_disaggregation_enabled_nixl_accepted():
@@ -55,6 +57,13 @@ def test_disaggregation_zero_replicas_rejected():
 def test_disaggregation_bad_bootstrap_port_rejected():
     with pytest.raises(ValueError, match="bootstrap_port"):
         DisaggregationConfig(enabled=True, bootstrap_port=70000)
+
+
+@pytest.mark.parametrize("field", ["prefill_gpu_memory_utilization", "decode_gpu_memory_utilization"])
+@pytest.mark.parametrize("value", [0, -0.1, 1.1])
+def test_disaggregation_bad_role_gpu_memory_utilization_rejected(field, value):
+    with pytest.raises(ValueError, match=field):
+        DisaggregationConfig(enabled=True, **{field: value})
 
 
 def test_disaggregation_disabled_skips_validation():

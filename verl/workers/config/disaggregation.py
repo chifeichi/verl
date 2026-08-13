@@ -77,6 +77,8 @@ class DisaggregationConfig(BaseConfig):
     prefill_replicas: int = 1
     decode_replicas: int = 1
     decode_tensor_model_parallel_size: Optional[int] = None
+    prefill_gpu_memory_utilization: Optional[float] = None
+    decode_gpu_memory_utilization: Optional[float] = None
     transfer_backend: str = "nixl"
     bootstrap_port: Optional[int] = None
     ib_device: Optional[str] = None
@@ -95,6 +97,12 @@ class DisaggregationConfig(BaseConfig):
                 f"disaggregation requires >=1 prefill and >=1 decode replica "
                 f"(got prefill_replicas={self.prefill_replicas}, decode_replicas={self.decode_replicas})"
             )
+        for role, value in (
+            ("prefill", self.prefill_gpu_memory_utilization),
+            ("decode", self.decode_gpu_memory_utilization),
+        ):
+            if value is not None and not 0 < value <= 1:
+                raise ValueError(f"{role}_gpu_memory_utilization must be in (0, 1], got {value}")
         if self.bootstrap_port is not None and not (0 < self.bootstrap_port < 65536):
             raise ValueError(f"bootstrap_port out of range: {self.bootstrap_port}")
         if self.transfer_backend == "mooncake" and self.mooncake_protocol not in _ALLOWED_MOONCAKE_PROTOCOLS:

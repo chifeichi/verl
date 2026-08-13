@@ -388,7 +388,21 @@ class vLLMPDReplica(vLLMReplica):
         zmq_base_trainer_rank: int = 0,
     ) -> ActorHandle:
         """Construct one PD ``vLLMHttpServer`` actor."""
-        per_role_config = _dc_replace(self.config, tensor_model_parallel_size=tp)
+        disagg = self.config.disaggregation
+        role_gpu_memory_utilization = (
+            disagg.prefill_gpu_memory_utilization
+            if role == "prefill"
+            else disagg.decode_gpu_memory_utilization
+        )
+        per_role_config = _dc_replace(
+            self.config,
+            tensor_model_parallel_size=tp,
+            gpu_memory_utilization=(
+                role_gpu_memory_utilization
+                if role_gpu_memory_utilization is not None
+                else self.config.gpu_memory_utilization
+            ),
+        )
 
         env_vars = {
             "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
