@@ -118,6 +118,16 @@ class vLLMHttpServer:
             )
         self._disaggregation_role = disaggregation_role
         self._disaggregation_kv_transfer_config = disaggregation_kv_transfer_config
+        connector_configs = (
+            (disaggregation_kv_transfer_config or {})
+            .get("kv_connector_extra_config", {})
+            .get("connectors", [])
+        )
+        self._pd_cache_pool_enabled = any(
+            cfg.get("kv_connector") == "AscendStoreConnector"
+            for cfg in connector_configs
+        )
+        self._pd_cache_namespace = ray.get_runtime_context().get_job_id()
         # Filled by vLLMPDReplica.set_pd_peer for prefill-side routing.
         self._pd_decode_peers: list[ActorHandle] = []
         self._pd_prefill_side_channel_host: Optional[str] = None
@@ -534,12 +544,15 @@ class vLLMHttpServer:
         priority: int = 0,
         kv_transfer_params: Optional[dict] = None,
         routing_key: Optional[str] = None,
+        cache_salt: Optional[str] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out.
 
         Args:
             kv_transfer_params: vLLM KV-transfer payload for PD requests.
-            routing_key: Stable session identifier for hash-based decode routing.
+            routing_key: Stable session identifier used by hash-based P-to-D policies.
+            cache_salt: vLLM prefix-cache namespace. PD cache pooling derives
+                this from the rollout weight version on the ingress Prefill.
         """
         prompt_ids = normalize_token_ids(prompt_ids)
         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
@@ -553,6 +566,16 @@ class vLLMHttpServer:
                 mm_processor_kwargs=mm_processor_kwargs,
                 priority=priority,
                 routing_key=routing_key,
+                cache_salt=(
+                    cache_salt
+                    or (
+                        f"verl-{self._pd_cache_namespace}-policy-{self.global_steps}"
+                        if self.global_steps is not None
+                        else f"verl-{self._pd_cache_namespace}-policy-initial"
+                    )
+                )
+                if self._pd_cache_pool_enabled
+                else cache_salt,
             )
 
         # Calculate the maximum possible new tokens based on available context space
@@ -611,6 +634,8 @@ class vLLMHttpServer:
             multi_modal_data["audio"] = audio_data
 
         prompt_kwargs = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
+        if cache_salt is not None:
+            prompt_kwargs["cache_salt"] = cache_salt
         if mm_processor_kwargs:
             prompt_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
         try:
@@ -728,6 +753,7 @@ class vLLMHttpServer:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         priority: int = 0,
         routing_key: Optional[str] = None,
+        cache_salt: Optional[str] = None,
     ) -> TokenOutput:
         """Reserve a decode peer, run prefill locally, then dispatch decode."""
         effective_routing_key = routing_key or request_id
@@ -758,6 +784,7 @@ class vLLMHttpServer:
                 mm_processor_kwargs=mm_processor_kwargs,
                 priority=priority,
                 kv_transfer_params=prefill_kv_params,
+                cache_salt=cache_salt,
             )
             if is_mooncake:
                 if self._pd_prefill_side_channel_host is None:
@@ -789,6 +816,7 @@ class vLLMHttpServer:
                 mm_processor_kwargs=mm_processor_kwargs,
                 priority=priority,
                 kv_transfer_params=decode_kv_params,
+                cache_salt=cache_salt,
             )
         finally:
             self._pd_decode_selector.release(decode_peer_index)

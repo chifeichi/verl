@@ -31,7 +31,12 @@ from unittest.mock import patch
 
 import pytest
 
-from verl.workers.config import DisaggregationConfig, RolloutConfig, RoutingPolicyConfig
+from verl.workers.config import (
+    DisaggregationConfig,
+    KVCachePoolConfig,
+    RolloutConfig,
+    RoutingPolicyConfig,
+)
 from verl.workers.rollout.vllm_rollout.pd_routing import DecodePeerSelector
 
 # ---------------------------------------------------------------------------
@@ -47,12 +52,40 @@ def test_disaggregation_defaults_disabled_and_valid():
     assert cfg.transfer_backend == "nixl"
     assert cfg.bootstrap_port is None
     assert cfg.ib_device is None
+    assert cfg.cache_pool.enabled is False
+    assert cfg.cache_pool.consumer_is_to_put is False
+    assert cfg.cache_pool.store_decode_kv is False
 
 
 def test_disaggregation_enabled_nixl_accepted():
     cfg = DisaggregationConfig(enabled=True, transfer_backend="nixl")
     assert cfg.enabled is True
     assert cfg.transfer_backend == "nixl"
+
+
+def test_cache_pool_requires_mooncake_transport():
+    with pytest.raises(ValueError, match="cache_pool requires"):
+        DisaggregationConfig(
+            enabled=True,
+            transfer_backend="nixl",
+            cache_pool=KVCachePoolConfig(enabled=True),
+        )
+
+
+def test_cache_pool_accepts_ascend_store_backends():
+    for backend in ("mooncake", "memcache", "yuanrong"):
+        cfg = DisaggregationConfig(
+            enabled=True,
+            transfer_backend="mooncake",
+            cache_pool={"enabled": True, "backend": backend},
+        )
+        assert isinstance(cfg.cache_pool, KVCachePoolConfig)
+        assert cfg.cache_pool.backend == backend
+
+
+def test_cache_pool_rejects_unknown_backend():
+    with pytest.raises(ValueError, match="cache_pool.backend"):
+        KVCachePoolConfig(enabled=True, backend="unknown")
 
 
 def test_disaggregation_decode_policy_uses_vllm_router_defaults():
@@ -156,10 +189,20 @@ def test_rollout_config_accepts_dict_disaggregation():
     """Hydra/OmegaConf hands the field as a plain dict; post_init must coerce."""
     cfg = RolloutConfig(
         name="vllm",
-        disaggregation={"enabled": True, "decode_replicas": 3},
+        disaggregation={
+            "enabled": True,
+            "decode_replicas": 3,
+            "decode_policy": {"type": "power_of_two"},
+            "cache_pool": {"enabled": True, "backend": "mooncake"},
+            "transfer_backend": "mooncake",
+        },
     )
     assert isinstance(cfg.disaggregation, DisaggregationConfig)
     assert cfg.disaggregation.decode_replicas == 3
+    assert isinstance(cfg.disaggregation.decode_policy, RoutingPolicyConfig)
+    assert cfg.disaggregation.decode_policy.type == "power_of_two"
+    assert isinstance(cfg.disaggregation.cache_pool, KVCachePoolConfig)
+    assert cfg.disaggregation.cache_pool.enabled is True
 
 
 def test_rollout_config_accepts_dictconfig_disaggregation():
@@ -208,6 +251,7 @@ def _build_kv_cfg(
     kv_port=None,
     prefill_tp=None,
     decode_tp=None,
+    cache_pool_config=None,
 ):
     # Lazy import: only meaningful when vllm-rollout deps are importable.
     pytest.importorskip("vllm")
@@ -222,6 +266,7 @@ def _build_kv_cfg(
         kv_port=kv_port,
         prefill_tp=prefill_tp,
         decode_tp=decode_tp,
+        cache_pool_config=cache_pool_config,
     )
 
 
@@ -249,6 +294,45 @@ def test_build_kv_transfer_config_mooncake_backend(role, expected_role):
     cfg = _build_kv_cfg(role=role, transfer_backend="mooncake")
     assert cfg["kv_connector"] == "MooncakeConnector"
     assert cfg["kv_role"] == expected_role
+
+
+@pytest.mark.parametrize(
+    "role,consumer_put",
+    [("prefill", False), ("decode", True)],
+)
+def test_build_ascend_cache_pool_multiconnector(role, consumer_put):
+    cfg = _build_kv_cfg(
+        role=role,
+        transfer_backend="mooncake",
+        use_ascend_mooncake_v1=True,
+        kv_port=20001,
+        prefill_tp=4,
+        decode_tp=4,
+        cache_pool_config={
+            "enabled": True,
+            "backend": "mooncake",
+            "consumer_is_to_put": True,
+            "store_decode_kv": True,
+            "consumer_is_to_load": False,
+            "load_async": False,
+            "use_layerwise": False,
+            "extra_config": {"discard_partial_chunks": True},
+        },
+    )
+
+    assert cfg["kv_connector"] == "MultiConnector"
+    assert cfg["kv_load_failure_policy"] == "recompute"
+    connectors = cfg["kv_connector_extra_config"]["connectors"]
+    assert connectors[0]["kv_connector"] == "MooncakeConnectorV1"
+    assert connectors[0]["kv_port"] == 20001
+    assert connectors[1]["kv_connector"] == "AscendStoreConnector"
+    store_extra = connectors[1]["kv_connector_extra_config"]
+    assert store_extra["backend"] == "mooncake"
+    assert store_extra["consumer_is_to_put"] is consumer_put
+    assert store_extra["save_decode_cache"] is consumer_put
+    assert store_extra["consumer_is_to_load"] is False
+    assert store_extra["discard_partial_chunks"] is True
+    assert store_extra["lookup_rpc_port"] == "test-eid"
 
 
 def test_build_kv_transfer_config_mooncake_protocol_pinned():
@@ -624,6 +708,7 @@ async def test_pd_dispatch_routes_prefill_leg_then_decode_peer():
         prompt_ids=[1, 2, 3],
         sampling_params={"max_tokens": 64, "temperature": 0.0},
         request_id="req-foo",
+        cache_salt="verl-policy-7",
     )
 
     # Prefill leg was called once with max_tokens=1 + do_remote_decode params.
@@ -636,9 +721,11 @@ async def test_pd_dispatch_routes_prefill_leg_then_decode_peer():
     assert pcall["kv_transfer_params"]["do_remote_decode"] is True
     assert pcall["kv_transfer_params"]["do_remote_prefill"] is False
     assert "transfer_id" in pcall["kv_transfer_params"]
+    assert pcall["cache_salt"] == "verl-policy-7"
 
     # Decode peer was called with full sampling_params + the prefill's kv_transfer_params.
     decode_peer.generate.remote.assert_called_once()
+    assert decode_peer.generate.remote.call_args.kwargs["cache_salt"] == "verl-policy-7"
     dkw = decode_peer.generate.remote.call_args
     # generate(prompt_ids, sampling_params, request_id, **kw); first three are positional.
     assert dkw.args[0] == [1, 2, 3]
