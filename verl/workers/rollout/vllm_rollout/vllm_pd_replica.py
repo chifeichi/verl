@@ -122,6 +122,21 @@ class vLLMPDReplica(vLLMReplica):
         )
         use_ascend_mooncake_v1 = is_torch_npu_available(check_device=False)
         transfer_backend = self.config.disaggregation.transfer_backend
+        cache_pool = self.config.disaggregation.cache_pool
+        if cache_pool.enabled and not use_ascend_mooncake_v1:
+            raise NotImplementedError(
+                "PD cache_pool currently requires vLLM-Ascend with MooncakeConnectorV1"
+            )
+        cache_pool_config = {
+            "enabled": cache_pool.enabled,
+            "backend": cache_pool.backend,
+            "consumer_is_to_put": cache_pool.consumer_is_to_put,
+            "store_decode_kv": cache_pool.store_decode_kv,
+            "consumer_is_to_load": cache_pool.consumer_is_to_load,
+            "load_async": cache_pool.load_async,
+            "use_layerwise": cache_pool.use_layerwise,
+            "extra_config": dict(cache_pool.extra_config),
+        }
         if use_ascend_mooncake_v1 and transfer_backend == "nixl":
             logger.warning(
                 "NixlConnector is not supported for Ascend PD; falling back to "
@@ -185,6 +200,7 @@ class vLLMPDReplica(vLLMReplica):
                     kv_port=prefill_side_channel_port,
                     prefill_tp=self._prefill_tp,
                     decode_tp=self._decode_tp,
+                    cache_pool_config=cache_pool_config,
                 )
                 self._prefill_servers.append(
                     self._spawn_pd_server(
@@ -225,6 +241,7 @@ class vLLMPDReplica(vLLMReplica):
                     kv_port=decode_side_channel_port,
                     prefill_tp=self._prefill_tp,
                     decode_tp=self._decode_tp,
+                    cache_pool_config=cache_pool_config,
                 )
                 self._decode_servers.append(
                     self._spawn_pd_server(
@@ -338,6 +355,7 @@ class vLLMPDReplica(vLLMReplica):
         kv_port: Optional[int] = None,
         prefill_tp: Optional[int] = None,
         decode_tp: Optional[int] = None,
+        cache_pool_config: Optional[dict] = None,
     ) -> dict:
         """Assemble vLLM's ``--kv-transfer-config`` payload."""
         role_to_kv_role = {
@@ -369,6 +387,51 @@ class vLLMPDReplica(vLLMReplica):
                 "prefill": {"dp_size": 1, "tp_size": prefill_tp},
                 "decode": {"dp_size": 1, "tp_size": decode_tp},
             }
+            if cache_pool_config and cache_pool_config.get("enabled", False):
+                mooncake_cfg = dict(cfg)
+                store_extra = dict(cache_pool_config.get("extra_config", {}))
+                store_extra.update(
+                    {
+                        "backend": cache_pool_config.get("backend", "mooncake"),
+                        # AscendStore uses this value as an IPC path suffix, not
+                        # as a TCP listener. The engine id prevents collisions
+                        # between multiple P/D engines on the same node.
+                        "lookup_rpc_port": engine_id,
+                        "consumer_is_to_put": bool(
+                            role == "decode"
+                            and cache_pool_config.get("consumer_is_to_put", False)
+                        ),
+                        "store_decode_kv": bool(
+                            role == "decode"
+                            and cache_pool_config.get("store_decode_kv", False)
+                        ),
+                        "consumer_is_to_load": bool(
+                            role == "decode"
+                            and cache_pool_config.get("consumer_is_to_load", False)
+                        ),
+                        "load_async": bool(cache_pool_config.get("load_async", False)),
+                        "use_layerwise": bool(
+                            cache_pool_config.get("use_layerwise", False)
+                        ),
+                    }
+                )
+                store_cfg = {
+                    "kv_connector": "AscendStoreConnector",
+                    "kv_role": role_to_kv_role[role],
+                    "kv_connector_extra_config": store_extra,
+                }
+                cfg = {
+                    "kv_connector": "MultiConnector",
+                    "kv_role": role_to_kv_role[role],
+                    "engine_id": engine_id,
+                    "kv_buffer_device": get_device_name(),
+                    "kv_load_failure_policy": "recompute",
+                    "kv_connector_extra_config": {
+                        # Direct P-to-D transfer wins for the current turn;
+                        # AscendStore supplies shared-prefix hits on later turns.
+                        "connectors": [mooncake_cfg, store_cfg]
+                    },
+                }
         elif transfer_backend == "mooncake" and mooncake_protocol:
             cfg["kv_connector_extra_config"] = {"mooncake_protocol": mooncake_protocol}
         return cfg

@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["DisaggregationConfig", "RoutingPolicyConfig"]
+__all__ = ["DisaggregationConfig", "KVCachePoolConfig", "RoutingPolicyConfig"]
 
 _ALLOWED_BACKENDS = ("nixl", "mooncake", "ascend", "mori", "fake")
 _ALLOWED_MOONCAKE_PROTOCOLS = ("nvlink", "local", "rdma", "tcp")
+_ALLOWED_CACHE_POOL_BACKENDS = ("mooncake", "memcache", "yuanrong")
 _ALLOWED_ROUTING_POLICIES = (
     "random",
     "round_robin",
@@ -70,6 +71,32 @@ class RoutingPolicyConfig(BaseConfig):
 
 
 @dataclass
+class KVCachePoolConfig(BaseConfig):
+    """AscendStore-backed shared KV cache for PD rollout engines.
+
+    Field names intentionally mirror ``AscendStoreConnector``. Backend-
+    specific options are forwarded through ``extra_config`` without Verl
+    translating or interpreting them.
+    """
+
+    enabled: bool = False
+    backend: str = "mooncake"
+    consumer_is_to_put: bool = False
+    store_decode_kv: bool = False
+    consumer_is_to_load: bool = False
+    load_async: bool = False
+    use_layerwise: bool = False
+    extra_config: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.enabled and self.backend not in _ALLOWED_CACHE_POOL_BACKENDS:
+            raise ValueError(
+                f"cache_pool.backend={self.backend!r} not in "
+                f"{_ALLOWED_CACHE_POOL_BACKENDS}"
+            )
+
+
+@dataclass
 class DisaggregationConfig(BaseConfig):
     """Prefill-Decode disaggregation knobs."""
 
@@ -84,10 +111,13 @@ class DisaggregationConfig(BaseConfig):
     ib_device: Optional[str] = None
     mooncake_protocol: str = "nvlink"
     decode_policy: RoutingPolicyConfig = field(default_factory=RoutingPolicyConfig)
+    cache_pool: KVCachePoolConfig = field(default_factory=KVCachePoolConfig)
 
     def __post_init__(self) -> None:
         if not isinstance(self.decode_policy, RoutingPolicyConfig):
             object.__setattr__(self, "decode_policy", RoutingPolicyConfig(**dict(self.decode_policy)))
+        if not isinstance(self.cache_pool, KVCachePoolConfig):
+            object.__setattr__(self, "cache_pool", KVCachePoolConfig(**dict(self.cache_pool)))
         if not self.enabled:
             return
         if self.transfer_backend not in _ALLOWED_BACKENDS:
@@ -109,6 +139,8 @@ class DisaggregationConfig(BaseConfig):
             raise ValueError(
                 f"disaggregation.mooncake_protocol={self.mooncake_protocol!r} not in {_ALLOWED_MOONCAKE_PROTOCOLS}"
             )
+        if self.cache_pool.enabled and self.transfer_backend != "mooncake":
+            raise ValueError("disaggregation.cache_pool requires transfer_backend='mooncake'")
 
     def effective_decode_tp(self, prefill_tp: int) -> int:
         """Resolve decode TP (defaults to ``prefill_tp``). Test-only helper; runtime paths
