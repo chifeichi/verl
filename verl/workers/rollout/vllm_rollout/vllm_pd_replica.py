@@ -19,9 +19,11 @@ composite PD replica may span multiple nodes.
 """
 
 import asyncio
+import copy
 import logging
 import os
 import uuid
+from collections.abc import Mapping
 from dataclasses import replace as _dc_replace
 from typing import Any, Optional
 
@@ -35,6 +37,30 @@ from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+
+def _deep_merge_dict(base: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a recursive merge without mutating either input."""
+    merged = {key: copy.deepcopy(value) for key, value in base.items()}
+    for key, value in overrides.items():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
+            merged[key] = _deep_merge_dict(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _drop_none_values(values: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove unset Hydra schema values before applying role overrides."""
+    result: dict[str, Any] = {}
+    for key, value in values.items():
+        if isinstance(value, Mapping):
+            nested = _drop_none_values(value)
+            if nested:
+                result[key] = nested
+        elif value is not None:
+            result[key] = value
+    return result
 
 
 def _reserve_pd_port(worker) -> tuple[str, int]:
@@ -373,6 +399,36 @@ class vLLMPDReplica(vLLMReplica):
             cfg["kv_connector_extra_config"] = {"mooncake_protocol": mooncake_protocol}
         return cfg
 
+    def _build_pd_role_config(self, role: str, tp: int) -> RolloutConfig:
+        """Apply role-local vLLM settings without mutating the shared config."""
+        if role not in ("prefill", "decode"):
+            raise ValueError(f"unknown PD role: {role!r}")
+
+        disagg = self.config.disaggregation
+        role_gpu_memory_utilization = (
+            disagg.prefill_gpu_memory_utilization
+            if role == "prefill"
+            else disagg.decode_gpu_memory_utilization
+        )
+        role_engine_kwargs = (
+            disagg.prefill_engine_kwargs if role == "prefill" else disagg.decode_engine_kwargs
+        )
+        engine_kwargs = copy.deepcopy(self.config.engine_kwargs)
+        global_vllm_kwargs = engine_kwargs.get("vllm", {}) or {}
+        role_engine_kwargs = _drop_none_values(role_engine_kwargs or {})
+        engine_kwargs["vllm"] = _deep_merge_dict(global_vllm_kwargs, role_engine_kwargs)
+
+        return _dc_replace(
+            self.config,
+            tensor_model_parallel_size=tp,
+            gpu_memory_utilization=(
+                role_gpu_memory_utilization
+                if role_gpu_memory_utilization is not None
+                else self.config.gpu_memory_utilization
+            ),
+            engine_kwargs=engine_kwargs,
+        )
+
     def _spawn_pd_server(
         self,
         role: str,
@@ -388,21 +444,7 @@ class vLLMPDReplica(vLLMReplica):
         zmq_base_trainer_rank: int = 0,
     ) -> ActorHandle:
         """Construct one PD ``vLLMHttpServer`` actor."""
-        disagg = self.config.disaggregation
-        role_gpu_memory_utilization = (
-            disagg.prefill_gpu_memory_utilization
-            if role == "prefill"
-            else disagg.decode_gpu_memory_utilization
-        )
-        per_role_config = _dc_replace(
-            self.config,
-            tensor_model_parallel_size=tp,
-            gpu_memory_utilization=(
-                role_gpu_memory_utilization
-                if role_gpu_memory_utilization is not None
-                else self.config.gpu_memory_utilization
-            ),
-        )
+        per_role_config = self._build_pd_role_config(role, tp)
 
         env_vars = {
             "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",

@@ -30,6 +30,8 @@ def test_disaggregation_defaults_disabled_and_valid():
     assert cfg.ib_device is None
     assert cfg.prefill_gpu_memory_utilization is None
     assert cfg.decode_gpu_memory_utilization is None
+    assert cfg.prefill_engine_kwargs == {}
+    assert cfg.decode_engine_kwargs == {}
 
 
 def test_disaggregation_enabled_nixl_accepted():
@@ -64,6 +66,36 @@ def test_disaggregation_bad_bootstrap_port_rejected():
 def test_disaggregation_bad_role_gpu_memory_utilization_rejected(field, value):
     with pytest.raises(ValueError, match=field):
         DisaggregationConfig(enabled=True, **{field: value})
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+@pytest.mark.parametrize("field", ["max_num_batched_tokens", "max_num_seqs"])
+@pytest.mark.parametrize("value", [0, -1, 1.5, True])
+def test_disaggregation_bad_role_engine_integer_rejected(role, field, value):
+    with pytest.raises(ValueError, match=field):
+        DisaggregationConfig(enabled=True, **{f"{role}_engine_kwargs": {field: value}})
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_disaggregation_bad_role_capture_sizes_rejected(role):
+    with pytest.raises(ValueError, match="cudagraph_capture_sizes"):
+        DisaggregationConfig(
+            enabled=True,
+            **{f"{role}_engine_kwargs": {"compilation_config": {"cudagraph_capture_sizes": [1, 0]}}},
+        )
+
+
+def test_disaggregation_role_engine_kwargs_rejects_ambiguous_gpu_utilization():
+    with pytest.raises(ValueError, match="prefill_gpu_memory_utilization"):
+        DisaggregationConfig(enabled=True, prefill_engine_kwargs={"gpu_memory_utilization": 0.7})
+
+
+def test_disaggregation_role_engine_kwargs_rejects_invalid_scheduler_limits():
+    with pytest.raises(ValueError, match="must be >= max_num_seqs"):
+        DisaggregationConfig(
+            enabled=True,
+            decode_engine_kwargs={"max_num_batched_tokens": 64, "max_num_seqs": 128},
+        )
 
 
 def test_disaggregation_disabled_skips_validation():

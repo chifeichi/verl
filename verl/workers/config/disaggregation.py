@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
@@ -79,6 +79,12 @@ class DisaggregationConfig(BaseConfig):
     decode_tensor_model_parallel_size: Optional[int] = None
     prefill_gpu_memory_utilization: Optional[float] = None
     decode_gpu_memory_utilization: Optional[float] = None
+    # vLLM engine arguments applied only to the corresponding PD role. These
+    # are deep-merged over rollout.engine_kwargs.vllm at server construction
+    # time. Typical memory-sensitive overrides include max_num_batched_tokens,
+    # max_num_seqs, enforce_eager, and compilation_config.
+    prefill_engine_kwargs: dict[str, Any] = field(default_factory=dict)
+    decode_engine_kwargs: dict[str, Any] = field(default_factory=dict)
     transfer_backend: str = "nixl"
     bootstrap_port: Optional[int] = None
     ib_device: Optional[str] = None
@@ -103,6 +109,53 @@ class DisaggregationConfig(BaseConfig):
         ):
             if value is not None and not 0 < value <= 1:
                 raise ValueError(f"{role}_gpu_memory_utilization must be in (0, 1], got {value}")
+        for role, engine_kwargs in (
+            ("prefill", self.prefill_engine_kwargs),
+            ("decode", self.decode_engine_kwargs),
+        ):
+            if not isinstance(engine_kwargs, dict):
+                raise TypeError(f"{role}_engine_kwargs must be a dict, got {type(engine_kwargs).__name__}")
+            if "gpu_memory_utilization" in engine_kwargs:
+                raise ValueError(
+                    f"use {role}_gpu_memory_utilization instead of "
+                    f"{role}_engine_kwargs.gpu_memory_utilization"
+                )
+            for field_name in ("max_num_batched_tokens", "max_num_seqs"):
+                value = engine_kwargs.get(field_name)
+                if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
+                    raise ValueError(f"{role}_engine_kwargs.{field_name} must be a positive integer, got {value!r}")
+            max_num_batched_tokens = engine_kwargs.get("max_num_batched_tokens")
+            max_num_seqs = engine_kwargs.get("max_num_seqs")
+            if (
+                max_num_batched_tokens is not None
+                and max_num_seqs is not None
+                and max_num_batched_tokens < max_num_seqs
+            ):
+                raise ValueError(
+                    f"{role}_engine_kwargs.max_num_batched_tokens must be >= max_num_seqs "
+                    f"(got {max_num_batched_tokens} < {max_num_seqs})"
+                )
+            enforce_eager = engine_kwargs.get("enforce_eager")
+            if enforce_eager is not None and not isinstance(enforce_eager, bool):
+                raise ValueError(f"{role}_engine_kwargs.enforce_eager must be a bool, got {enforce_eager!r}")
+            capture_sizes = engine_kwargs.get("cudagraph_capture_sizes")
+            compilation_config = engine_kwargs.get("compilation_config")
+            if compilation_config is not None and not isinstance(compilation_config, dict):
+                raise ValueError(
+                    f"{role}_engine_kwargs.compilation_config must be a dict, got "
+                    f"{type(compilation_config).__name__}"
+                )
+            if capture_sizes is None and isinstance(compilation_config, dict):
+                capture_sizes = compilation_config.get("cudagraph_capture_sizes")
+            if capture_sizes is not None and (
+                not isinstance(capture_sizes, (list, tuple))
+                or not capture_sizes
+                or any(not isinstance(size, int) or isinstance(size, bool) or size < 1 for size in capture_sizes)
+            ):
+                raise ValueError(
+                    f"{role}_engine_kwargs.cudagraph_capture_sizes must be a non-empty sequence "
+                    f"of positive integers, got {capture_sizes!r}"
+                )
         if self.bootstrap_port is not None and not (0 < self.bootstrap_port < 65536):
             raise ValueError(f"bootstrap_port out of range: {self.bootstrap_port}")
         if self.transfer_backend == "mooncake" and self.mooncake_protocol not in _ALLOWED_MOONCAKE_PROTOCOLS:

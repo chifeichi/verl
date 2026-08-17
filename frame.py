@@ -7,8 +7,6 @@ import json
 import logging
 import os
 import random
-import time
-from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
@@ -165,30 +163,6 @@ def _json_default(obj: object) -> object:
             except Exception:
                 pass
     return str(obj)
-
-
-def _nested_value(root: object, path: tuple[str, ...]) -> object | None:
-    value = root
-    for key in path:
-        if not isinstance(value, Mapping) or key not in value:
-            return None
-        value = value[key]
-    return value
-
-
-def _sample_instance_id(sample_fields: Mapping[str, object]) -> object | None:
-    """Resolve the source-dataset identity across supported task schemas."""
-    paths = (
-        ("extra_info", "tools_kwargs", "reward", "metadata", "instance_id"),
-        ("extra_info", "tools_kwargs", "task", "metadata", "instance_id"),
-        ("tools_kwargs", "reward", "metadata", "instance_id"),
-        ("tools_kwargs", "task", "metadata", "instance_id"),
-    )
-    for path in paths:
-        value = _nested_value(sample_fields, path)
-        if value is not None:
-            return value
-    return None
 
 
 def _align_routed_experts(source: object, seq_len: int) -> torch.Tensor | None:
@@ -626,7 +600,6 @@ class OpenAICompatibleAgentFramework(AgentFramework):
     ) -> tuple[list[Trajectory], dict[str, object]]:
         """Run one gateway session lifecycle and return finalized trajectories."""
         session_id = f"session-sample-{sample_index}-rollout-{session_index}-{uuid4().hex}"
-        session_started_at = time.perf_counter()
         if self._log_dir:
             log_root = Path(self._log_dir)
             run_dir = (log_root if global_steps is None else log_root / f"step_{int(global_steps)}") / session_id
@@ -677,34 +650,12 @@ class OpenAICompatibleAgentFramework(AgentFramework):
                         **({"tools_kwargs": tools_kwargs} if tools_kwargs is not None else {}),
                     )
                 session_trajectories = await self.gateway_manager.finalize_session(session_id)
-            except Exception as exc:
+            except Exception:
                 logger.exception("session %s failed (runner=%s); aborting session", session_id, runner_name)
                 await self.gateway_manager.abort_session(session_id)
-                self._log_trajectory_summary(
-                    session_id=session_id,
-                    trajectories=[],
-                    sample_fields=sample_fields,
-                    sample_index=sample_index,
-                    session_index=session_index,
-                    global_steps=global_steps,
-                    elapsed_seconds=time.perf_counter() - session_started_at,
-                    status="failed",
-                    failure_reason=_short_failure_reason(exc),
-                )
                 raise
 
             if not session_trajectories:
-                self._log_trajectory_summary(
-                    session_id=session_id,
-                    trajectories=[],
-                    sample_fields=sample_fields,
-                    sample_index=sample_index,
-                    session_index=session_index,
-                    global_steps=global_steps,
-                    elapsed_seconds=time.perf_counter() - session_started_at,
-                    status="empty",
-                    failure_reason="finalize_session returned no trajectories",
-                )
                 return session_trajectories, sample_fields
 
             # Prefer the reward the runner posted to the session (report_reward=True);
@@ -730,14 +681,12 @@ class OpenAICompatibleAgentFramework(AgentFramework):
                 ]
 
             self._log_trajectory_summary(
-                session_id=session_id,
-                trajectories=result_trajectories,
-                sample_fields=sample_fields,
+                session_id,
+                result_trajectories,
+                sample_fields,
                 sample_index=sample_index,
                 session_index=session_index,
                 global_steps=global_steps,
-                elapsed_seconds=time.perf_counter() - session_started_at,
-                status="success",
             )
             if run_dir is not None:
                 await asyncio.to_thread(self._dump_trajectories, run_dir, session_id, result_trajectories)
@@ -745,44 +694,80 @@ class OpenAICompatibleAgentFramework(AgentFramework):
 
     def _log_trajectory_summary(
         self,
-        *,
         session_id: str,
         trajectories: list[Trajectory],
-        sample_fields: Mapping[str, object],
+        sample_fields: dict[str, object],
+        *,
         sample_index: int,
         session_index: int,
         global_steps: int | None,
-        elapsed_seconds: float,
-        status: str,
-        failure_reason: str | None = None,
     ) -> None:
-        """Log raw per-session trajectory data for offline analysis."""
-        record = {
-            "session_id": session_id,
-            "instance_id": _sample_instance_id(sample_fields),
-            "uid": sample_fields.get("uid"),
-            "data_source": sample_fields.get("data_source"),
-            "global_steps": global_steps,
-            "sample_index": sample_index,
-            "session_index": session_index,
-            "status": status,
-            "failure_reason": failure_reason,
-            "elapsed_seconds": round(float(elapsed_seconds), 6),
-            "trajectories": [self._trajectory_meta(traj) for traj in trajectories],
-        }
-        logger.info(
-            "session %s: status=%s instance_id=%s trajectories=%s elapsed_seconds=%.3f",
-            session_id,
-            status,
-            record["instance_id"],
-            len(trajectories),
-            elapsed_seconds,
+        """Log a per-session trajectory summary -- the info the task layer can't emit,
+        since trajectories exist only after the session finalizes."""
+        instance_id = self._get_rollout_instance_id(sample_fields)
+        uid = str(sample_fields.get("uid", ""))
+        lines = [f"session {session_id}: {len(trajectories)} trajectory(ies)"]
+        for i, traj in enumerate(trajectories):
+            model_tokens = sum(traj.response_mask) if traj.response_mask else 0
+            reason = (traj.extra_fields or {}).get("materialization_reason")
+            reward_info = dict(traj.reward_info or {})
+            eval_report = reward_info.get("eval_report")
+            if not isinstance(eval_report, dict):
+                eval_report = {}
+            rollout_record = {
+                "instance_id": instance_id,
+                "uid": uid,
+                "session_id": session_id,
+                "sample_index": sample_index,
+                "session_index": session_index,
+                "global_steps": global_steps,
+                "trajectory_index": i,
+                "num_turns": traj.num_turns,
+                "prompt_tokens": len(traj.prompt_ids),
+                "response_tokens": len(traj.response_ids),
+                "model_tokens": model_tokens,
+                "total_tokens": len(traj.prompt_ids) + len(traj.response_ids),
+                "reward_score": traj.reward_score,
+                "claude_code_exit_code": reward_info.get("claude_code_exit_code"),
+                "eval_completed": reward_info.get("eval_completed"),
+                "eval_execution_time": reward_info.get("eval_execution_time"),
+                "resolved": reward_info.get("resolved"),
+                "found_eval_status": eval_report.get("found_eval_status"),
+                "materialization_reason": reason,
+            }
+            print(f"[ROLLOUT_SAMPLE] {json.dumps(rollout_record, ensure_ascii=False, default=str)}", flush=True)
+            lines.append(
+                f"  [{i}] turns={traj.num_turns} prompt_tokens={len(traj.prompt_ids)} "
+                f"response_tokens={len(traj.response_ids)} model_tokens={model_tokens} "
+                f"logprobs={'yes' if traj.response_logprobs else 'no'} "
+                f"experts={'yes' if traj.routed_experts is not None else 'no'} "
+                f"reward_score={traj.reward_score} reward_info={traj.reward_info or {}}"
+                + (f" materialization_reason={reason}" if reason else "")
+            )
+        logger.info("\n".join(lines))
+
+    @staticmethod
+    def _get_rollout_instance_id(sample_fields: dict[str, object]) -> str:
+        def nested_get(value: object, *path: str) -> object | None:
+            current = value
+            for key in path:
+                if not isinstance(current, dict):
+                    return None
+                current = current.get(key)
+            return current
+
+        candidates = (
+            sample_fields.get("instance_id"),
+            nested_get(sample_fields, "tools_kwargs", "task", "metadata", "instance_id"),
+            nested_get(sample_fields, "tools_kwargs", "reward", "metadata", "ground_truth", "instance_id"),
+            nested_get(sample_fields, "tools_kwargs", "reward", "metadata", "instance_id"),
+            nested_get(sample_fields, "reward_model", "ground_truth", "instance_id"),
+            nested_get(sample_fields, "extra_info", "instance_id"),
         )
-        print(
-            "[VERL_ROLLOUT_SAMPLE] "
-            + json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=_json_default),
-            flush=True,
-        )
+        for candidate in candidates:
+            if candidate is not None and str(candidate):
+                return str(candidate)
+        return ""
 
     def _dump_trajectories(self, run_dir: Path, session_id: str, trajectories: list[Trajectory]) -> None:
         """Persist finalized trajectories next to ``task.log``.

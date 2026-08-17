@@ -490,6 +490,24 @@ disaggregation:
   prefill_gpu_memory_utilization: null
   decode_gpu_memory_utilization: null
 
+  # Per-role vLLM engine arguments, deep-merged over rollout.engine_kwargs.vllm.
+  # Useful KV-capacity controls include max_num_batched_tokens, max_num_seqs,
+  # enforce_eager, cudagraph_capture_sizes, and compilation_config.
+  prefill_engine_kwargs:
+    max_num_batched_tokens: null
+    max_num_seqs: null
+    enforce_eager: null
+    compilation_config:
+      cudagraph_mode: null
+      cudagraph_capture_sizes: null
+  decode_engine_kwargs:
+    max_num_batched_tokens: null
+    max_num_seqs: null
+    enforce_eager: null
+    compilation_config:
+      cudagraph_mode: null
+      cudagraph_capture_sizes: null
+
   # KV cache transport: nixl | mooncake | ascend | mori | fake.
   transfer_backend: nixl
 

@@ -344,6 +344,8 @@ def _make_pd_config(**overrides) -> RolloutConfig:
         decode_tensor_model_parallel_size=overrides.pop("decode_tensor_model_parallel_size", None),
         prefill_gpu_memory_utilization=overrides.pop("prefill_gpu_memory_utilization", None),
         decode_gpu_memory_utilization=overrides.pop("decode_gpu_memory_utilization", None),
+        prefill_engine_kwargs=overrides.pop("prefill_engine_kwargs", {}),
+        decode_engine_kwargs=overrides.pop("decode_engine_kwargs", {}),
         ib_device=overrides.pop("ib_device", None),
     )
     return RolloutConfig(
@@ -465,6 +467,54 @@ def test_pd_replica_init_accepts_multi_node_pool(patched_replica_cls):
 
     assert replica.world_size == 16
     assert replica.nnodes == 2
+
+
+def test_pd_role_engine_kwargs_deep_merge_without_cross_role_mutation(patched_replica_cls):
+    cfg = _make_pd_config(
+        prefill_engine_kwargs={
+            "max_num_batched_tokens": 65536,
+            "max_num_seqs": None,
+            "compilation_config": {"cudagraph_capture_sizes": [1]},
+        },
+        decode_engine_kwargs={
+            "max_num_batched_tokens": 2048,
+            "max_num_seqs": 256,
+            "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"},
+        },
+        engine_kwargs={
+            "vllm": {
+                "max_num_seqs": 512,
+                "compilation_config": {
+                    "cudagraph_mode": "FULL_AND_PIECEWISE",
+                    "custom_ops": ["all"],
+                }
+            }
+        },
+    )
+    replica = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+
+    prefill = replica._build_pd_role_config("prefill", tp=1)
+    decode = replica._build_pd_role_config("decode", tp=1)
+
+    assert prefill.engine_kwargs["vllm"] == {
+        "max_num_batched_tokens": 65536,
+        "max_num_seqs": 512,
+        "compilation_config": {
+            "cudagraph_mode": "FULL_AND_PIECEWISE",
+            "cudagraph_capture_sizes": [1],
+            "custom_ops": ["all"],
+        },
+    }
+    assert decode.engine_kwargs["vllm"] == {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 256,
+        "compilation_config": {
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "custom_ops": ["all"],
+        },
+    }
+    assert cfg.engine_kwargs["vllm"]["compilation_config"]["cudagraph_mode"] == "FULL_AND_PIECEWISE"
+    assert replica.config.engine_kwargs["vllm"]["compilation_config"]["cudagraph_mode"] == "FULL_AND_PIECEWISE"
 
 
 def test_pd_replica_exposes_every_prefill_as_request_endpoint(patched_replica_cls):
