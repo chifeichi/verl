@@ -87,21 +87,20 @@ class ServerAdapter(BaseRollout):
         self.node_rank = self.rollout_rank // local_world_size
 
         # Map each trainer rank to its co-located vLLM server so weight-update
-        # IPC handles stay on the GPU where they were created. Offset math
-        # assumes prefill_replicas == 1 (enforced by vLLMPDReplica); if that
-        # ever lifts, update both this block and vLLMPDReplica.launch_servers.
+        # IPC handles stay on the GPU where they were created.
         self._pd_role: Optional[str] = None
         self._pd_server_index: Optional[int] = None
         self._pd_tp_local_rank: Optional[int] = None
         if disagg is not None and getattr(disagg, "enabled", False):
-            footprint = prefill_tp + disagg.decode_replicas * decode_tp
+            prefill_footprint = disagg.prefill_replicas * prefill_tp
+            footprint = prefill_footprint + disagg.decode_replicas * decode_tp
             local = self.rollout_rank % footprint
-            if local < prefill_tp:
+            if local < prefill_footprint:
                 self._pd_role = "prefill"
-                self._pd_server_index = 0
-                self._pd_tp_local_rank = local
+                self._pd_server_index = local // prefill_tp
+                self._pd_tp_local_rank = local % prefill_tp
             else:
-                off = local - prefill_tp
+                off = local - prefill_footprint
                 self._pd_role = "decode"
                 self._pd_server_index = off // decode_tp
                 self._pd_tp_local_rank = off % decode_tp
@@ -157,7 +156,7 @@ class ServerAdapter(BaseRollout):
         if self.server_handle is None:
             prefix = self._get_server_name_prefix()
             if self._pd_role == "prefill":
-                actor_name = f"{prefix}server_{self.replica_rank}_0"
+                actor_name = f"{prefix}server_{self.replica_rank}_{self._pd_server_index}"
             elif self._pd_role == "decode":
                 actor_name = f"{prefix}server_decode_{self.replica_rank}_{self._pd_server_index}"
             else:

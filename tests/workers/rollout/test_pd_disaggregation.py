@@ -28,6 +28,10 @@ def test_disaggregation_defaults_disabled_and_valid():
     assert cfg.transfer_backend == "nixl"
     assert cfg.bootstrap_port is None
     assert cfg.ib_device is None
+    assert cfg.prefill_gpu_memory_utilization is None
+    assert cfg.decode_gpu_memory_utilization is None
+    assert cfg.prefill_engine_kwargs == {}
+    assert cfg.decode_engine_kwargs == {}
 
 
 def test_disaggregation_enabled_nixl_accepted():
@@ -55,6 +59,43 @@ def test_disaggregation_zero_replicas_rejected():
 def test_disaggregation_bad_bootstrap_port_rejected():
     with pytest.raises(ValueError, match="bootstrap_port"):
         DisaggregationConfig(enabled=True, bootstrap_port=70000)
+
+
+@pytest.mark.parametrize("field", ["prefill_gpu_memory_utilization", "decode_gpu_memory_utilization"])
+@pytest.mark.parametrize("value", [0, -0.1, 1.1])
+def test_disaggregation_bad_role_gpu_memory_utilization_rejected(field, value):
+    with pytest.raises(ValueError, match=field):
+        DisaggregationConfig(enabled=True, **{field: value})
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+@pytest.mark.parametrize("field", ["max_num_batched_tokens", "max_num_seqs"])
+@pytest.mark.parametrize("value", [0, -1, 1.5, True])
+def test_disaggregation_bad_role_engine_integer_rejected(role, field, value):
+    with pytest.raises(ValueError, match=field):
+        DisaggregationConfig(enabled=True, **{f"{role}_engine_kwargs": {field: value}})
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_disaggregation_bad_role_capture_sizes_rejected(role):
+    with pytest.raises(ValueError, match="cudagraph_capture_sizes"):
+        DisaggregationConfig(
+            enabled=True,
+            **{f"{role}_engine_kwargs": {"compilation_config": {"cudagraph_capture_sizes": [1, 0]}}},
+        )
+
+
+def test_disaggregation_role_engine_kwargs_rejects_ambiguous_gpu_utilization():
+    with pytest.raises(ValueError, match="prefill_gpu_memory_utilization"):
+        DisaggregationConfig(enabled=True, prefill_engine_kwargs={"gpu_memory_utilization": 0.7})
+
+
+def test_disaggregation_role_engine_kwargs_rejects_invalid_scheduler_limits():
+    with pytest.raises(ValueError, match="must be >= max_num_seqs"):
+        DisaggregationConfig(
+            enabled=True,
+            decode_engine_kwargs={"max_num_batched_tokens": 64, "max_num_seqs": 128},
+        )
 
 
 def test_disaggregation_disabled_skips_validation():
@@ -130,43 +171,50 @@ def test_dispatch_non_pd_backend_with_flag_raises():
         get_rollout_replica_class("trtllm", disaggregation_enabled=True)
 
 
-def _assign_pd_role(rollout_rank: int, prefill_tp: int, decode_replicas: int, decode_tp: int):
+def _assign_pd_role(
+    rollout_rank: int,
+    prefill_replicas: int,
+    prefill_tp: int,
+    decode_replicas: int,
+    decode_tp: int,
+):
     """Mirror of ServerAdapter.__init__'s role-assignment block."""
-    if rollout_rank < prefill_tp:
-        return "prefill", 0, rollout_rank
-    off = rollout_rank - prefill_tp
+    prefill_footprint = prefill_replicas * prefill_tp
+    if rollout_rank < prefill_footprint:
+        return "prefill", rollout_rank // prefill_tp, rollout_rank % prefill_tp
+    off = rollout_rank - prefill_footprint
     if off < decode_replicas * decode_tp:
         return "decode", off // decode_tp, off % decode_tp
     return None, None, None
 
 
 @pytest.mark.parametrize(
-    "prefill_tp,decode_replicas,decode_tp,rollout_rank,expected",
+    "prefill_replicas,prefill_tp,decode_replicas,decode_tp,rollout_rank,expected",
     [
-        (1, 3, 1, 0, ("prefill", 0, 0)),
-        (1, 3, 1, 1, ("decode", 0, 0)),
-        (1, 3, 1, 2, ("decode", 1, 0)),
-        (1, 3, 1, 3, ("decode", 2, 0)),
-        (1, 7, 1, 0, ("prefill", 0, 0)),
-        (1, 7, 1, 7, ("decode", 6, 0)),
-        (2, 3, 2, 0, ("prefill", 0, 0)),
-        (2, 3, 2, 1, ("prefill", 0, 1)),
-        (2, 3, 2, 2, ("decode", 0, 0)),
-        (2, 3, 2, 3, ("decode", 0, 1)),
-        (2, 3, 2, 6, ("decode", 2, 0)),
-        (2, 3, 2, 7, ("decode", 2, 1)),
+        (1, 1, 3, 1, 0, ("prefill", 0, 0)),
+        (1, 1, 3, 1, 1, ("decode", 0, 0)),
+        (1, 2, 3, 2, 1, ("prefill", 0, 1)),
+        (1, 2, 3, 2, 2, ("decode", 0, 0)),
+        (2, 2, 2, 2, 0, ("prefill", 0, 0)),
+        (2, 2, 2, 2, 2, ("prefill", 1, 0)),
+        (2, 2, 2, 2, 3, ("prefill", 1, 1)),
+        (2, 2, 2, 2, 4, ("decode", 0, 0)),
+        (2, 2, 2, 2, 7, ("decode", 1, 1)),
     ],
 )
-def test_pd_role_assignment(prefill_tp, decode_replicas, decode_tp, rollout_rank, expected):
-    assert _assign_pd_role(rollout_rank, prefill_tp, decode_replicas, decode_tp) == expected
+def test_pd_role_assignment(prefill_replicas, prefill_tp, decode_replicas, decode_tp, rollout_rank, expected):
+    assert _assign_pd_role(rollout_rank, prefill_replicas, prefill_tp, decode_replicas, decode_tp) == expected
 
 
-@pytest.mark.parametrize("prefill_tp,decode_replicas,decode_tp", [(1, 3, 1), (1, 7, 1), (2, 3, 2), (1, 1, 4)])
-def test_pd_role_covers_every_rank_exactly_once(prefill_tp, decode_replicas, decode_tp):
-    world = prefill_tp + decode_replicas * decode_tp
+@pytest.mark.parametrize(
+    "prefill_replicas,prefill_tp,decode_replicas,decode_tp",
+    [(1, 1, 3, 1), (1, 2, 3, 2), (2, 2, 2, 2), (3, 1, 1, 4)],
+)
+def test_pd_role_covers_every_rank_exactly_once(prefill_replicas, prefill_tp, decode_replicas, decode_tp):
+    world = prefill_replicas * prefill_tp + decode_replicas * decode_tp
     seen: set[tuple[str, int, int]] = set()
     for rr in range(world):
-        role, srv, tp_rank = _assign_pd_role(rr, prefill_tp, decode_replicas, decode_tp)
+        role, srv, tp_rank = _assign_pd_role(rr, prefill_replicas, prefill_tp, decode_replicas, decode_tp)
         assert role is not None, f"rollout_rank={rr} got no role"
         seen.add((role, srv, tp_rank))
     assert len(seen) == world, "each rank must map to a distinct (role, server_index, tp_local_rank) triple"
