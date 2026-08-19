@@ -327,6 +327,19 @@ class vLLMPDReplica(vLLMReplica):
             raise RuntimeError("PD prefill servers have not been launched")
         return list(zip(self._prefill_server_addresses, self._prefill_servers, strict=True))
 
+    async def sleep(self):
+        """Drain PD requests, disconnect peers, then sleep all P/D servers."""
+        await asyncio.gather(
+            *[server.wait_for_requests_to_drain.remote() for _, server in self.get_request_server_endpoints()]
+        )
+        await asyncio.gather(
+            *[
+                server.collective_rpc.remote(method="disconnect_kv_transfer_peers")
+                for server in self.servers
+            ]
+        )
+        await asyncio.gather(*[server.sleep.remote() for server in self.servers])
+
     def get_metrics_server_endpoints(self) -> list[tuple[str, dict[str, Any]]]:
         """Expose all P/D vLLM metrics endpoints without changing request routing."""
         if len(self._prefill_server_addresses) != len(self._prefill_servers):
