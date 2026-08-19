@@ -96,6 +96,7 @@ class vLLMHttpServer:
         cuda_visible_devices: str,
         disaggregation_role: str = "null",
         disaggregation_kv_transfer_config: Optional[dict] = None,
+        disaggregation_index: int = -1,
     ):
         """
         Args:
@@ -109,6 +110,7 @@ class vLLMHttpServer:
             cuda_visible_devices (str): cuda visible devices.
             disaggregation_role: PD role, or ``"null"`` for normal rollout.
             disaggregation_kv_transfer_config: vLLM KVTransferConfig dict for PD.
+            disaggregation_index: Index within the prefill or decode pool.
         """
         if disaggregation_role not in ("null", "prefill", "decode"):
             raise ValueError(f"disaggregation_role must be 'null'|'prefill'|'decode', got {disaggregation_role!r}")
@@ -127,6 +129,8 @@ class vLLMHttpServer:
 
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
         os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
+        os.environ["VERL_PD_ROLE"] = "unified" if disaggregation_role == "null" else disaggregation_role
+        os.environ["VERL_PD_INDEX"] = str(disaggregation_index)
         # Forward the Ray job id into the vLLM worker subprocess so the
         # colocated weight-transfer IPC socket path is unique per Ray job.
         # Without this, two concurrent verl jobs on the same node both bind

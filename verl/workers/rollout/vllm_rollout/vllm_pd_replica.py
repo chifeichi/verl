@@ -215,6 +215,7 @@ class vLLMPDReplica(vLLMReplica):
                 self._prefill_servers.append(
                     self._spawn_pd_server(
                         role="prefill",
+                        pd_index=i,
                         workers=prefill_workers,
                         node_id=prefill_node_id,
                         cuda_visible_devices=prefill_devs,
@@ -255,6 +256,7 @@ class vLLMPDReplica(vLLMReplica):
                 self._decode_servers.append(
                     self._spawn_pd_server(
                         role="decode",
+                        pd_index=i,
                         workers=workers_i,
                         node_id=node_id_i,
                         cuda_visible_devices=devs_i,
@@ -445,6 +447,7 @@ class vLLMPDReplica(vLLMReplica):
     def _spawn_pd_server(
         self,
         role: str,
+        pd_index: int,
         workers: list[ActorHandle],
         node_id: str,
         cuda_visible_devices: str,
@@ -491,5 +494,6 @@ class vLLMPDReplica(vLLMReplica):
             nnodes=1,
             cuda_visible_devices=cuda_visible_devices,
             disaggregation_role=role,
+            disaggregation_index=pd_index,
             disaggregation_kv_transfer_config=kv_transfer_config,
         )
