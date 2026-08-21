@@ -318,7 +318,7 @@ def test_build_ascend_cache_pool_multiconnector(role, consumer_put):
     )
 
     assert cfg["kv_connector"] == "MultiConnector"
-    assert cfg["kv_load_failure_policy"] == "recompute"
+    assert cfg["kv_load_failure_policy"] == "fail"
     connectors = cfg["kv_connector_extra_config"]["connectors"]
     assert connectors[0]["kv_connector"] == "MooncakeConnectorV1"
     assert connectors[0]["kv_port"] == 20001

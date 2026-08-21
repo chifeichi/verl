@@ -466,7 +466,9 @@ class vLLMPDReplica(vLLMReplica):
                     "kv_role": role_to_kv_role[role],
                     "engine_id": engine_id,
                     "kv_buffer_device": get_device_name(),
-                    "kv_load_failure_policy": "recompute",
+                    # vLLM-Ascend does not support recomputing failed KV loads
+                    # for hybrid models such as Qwen3.5.
+                    "kv_load_failure_policy": "fail",
                     "kv_connector_extra_config": {
                         # Direct P-to-D transfer wins for the current turn;
                         # AscendStore supplies shared-prefix hits on later turns.
