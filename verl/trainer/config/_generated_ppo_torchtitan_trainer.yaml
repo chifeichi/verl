@@ -377,6 +377,15 @@ actor_rollout_ref:
     quantization_config_file: null
     mtp: ${oc.select:actor_rollout_ref.model.mtp, null}
     qat: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat,${oc.select:actor_rollout_ref.actor.megatron.qat,null}}
+    cache_pool:
+      enabled: false
+      backend: mooncake
+      consumer_is_to_put: false
+      store_decode_kv: false
+      consumer_is_to_load: false
+      load_async: false
+      use_layerwise: false
+      extra_config: {}
     disaggregation:
       enabled: false
       prefill_replicas: 1
@@ -400,15 +409,6 @@ actor_rollout_ref:
         compilation_config:
           cudagraph_mode: null
           cudagraph_capture_sizes: null
-      cache_pool:
-        enabled: false
-        backend: mooncake
-        consumer_is_to_put: false
-        store_decode_kv: false
-        consumer_is_to_load: false
-        load_async: false
-        use_layerwise: false
-        extra_config: {}
       transfer_backend: nixl
       bootstrap_port: null
       ib_device: null
@@ -804,18 +804,18 @@ reward:
           compilation_config:
             cudagraph_mode: null
             cudagraph_capture_sizes: null
-        cache_pool:
-          enabled: false
-          backend: mooncake
-          consumer_is_to_put: false
-          store_decode_kv: false
-          consumer_is_to_load: false
-          load_async: false
-          use_layerwise: false
-          extra_config: {}
         transfer_backend: nixl
         bootstrap_port: null
         ib_device: null
+      cache_pool:
+        enabled: false
+        backend: mooncake
+        consumer_is_to_put: false
+        store_decode_kv: false
+        consumer_is_to_load: false
+        load_async: false
+        use_layerwise: false
+        extra_config: {}
   sandbox_fusion:
     _target_: verl.workers.config.SandboxFusionConfig
     url: null

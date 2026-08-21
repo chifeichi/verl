@@ -19,6 +19,7 @@ from omegaconf import MISSING, DictConfig, OmegaConf
 
 from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
+from verl.workers.config.cache_pool import KVCachePoolConfig
 from verl.workers.config.disaggregation import DisaggregationConfig
 from verl.workers.config.model import MtpConfig
 
@@ -271,6 +272,7 @@ class RolloutConfig(BaseConfig):
 
     qat: Optional[dict] = None
 
+    cache_pool: KVCachePoolConfig = field(default_factory=KVCachePoolConfig)
     disaggregation: DisaggregationConfig = field(default_factory=DisaggregationConfig)
 
     def __post_init__(self):
@@ -320,8 +322,22 @@ class RolloutConfig(BaseConfig):
                     f"Current rollout {self.name=} not implemented pipeline_model_parallel_size > 1 yet."
                 )
 
-        # Hydra passes this as dict/DictConfig; coerce to dataclass so
+        # Hydra passes these as dict/DictConfig; coerce to dataclasses so
         # downstream .enabled etc. work. BaseConfig is frozen, hence object.__setattr__.
+        if isinstance(self.cache_pool, dict):
+            object.__setattr__(self, "cache_pool", KVCachePoolConfig(**self.cache_pool))
+        elif not isinstance(self.cache_pool, KVCachePoolConfig):
+            if not isinstance(self.cache_pool, DictConfig):
+                raise TypeError(
+                    f"rollout.cache_pool must be dict, DictConfig, or KVCachePoolConfig; "
+                    f"got {type(self.cache_pool).__name__}."
+                )
+            object.__setattr__(
+                self,
+                "cache_pool",
+                KVCachePoolConfig(**OmegaConf.to_container(self.cache_pool, resolve=True)),
+            )
+
         if isinstance(self.disaggregation, dict):
             object.__setattr__(self, "disaggregation", DisaggregationConfig(**self.disaggregation))
         elif not isinstance(self.disaggregation, DisaggregationConfig):
@@ -340,3 +356,14 @@ class RolloutConfig(BaseConfig):
             raise ValueError(
                 f"rollout.disaggregation.enabled=True requires rollout.name in ('sglang', 'vllm'); got {self.name!r}."
             )
+        if self.cache_pool.enabled:
+            if self.name != "vllm" or not self.disaggregation.enabled:
+                raise ValueError(
+                    "rollout.cache_pool.enabled=True currently requires "
+                    "rollout.name='vllm' and rollout.disaggregation.enabled=True."
+                )
+            if self.disaggregation.transfer_backend != "mooncake":
+                raise ValueError(
+                    "rollout.cache_pool.enabled=True currently requires "
+                    "rollout.disaggregation.transfer_backend='mooncake'."
+                )

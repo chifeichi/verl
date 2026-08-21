@@ -461,6 +461,36 @@ mtp: ${oc.select:actor_rollout_ref.model.mtp, null}
 # QAT configuration (inherited from actor's engine config)
 qat: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat,${oc.select:actor_rollout_ref.actor.megatron.qat,null}}
 
+# Shared external KV cache for rollout engines. The current implementation
+# composes the vLLM-Ascend PD connector with AscendStoreConnector, so enabling
+# it still requires vLLM PD with the Mooncake transfer backend.
+cache_pool:
+
+  enabled: False
+
+  # AscendStore backend: mooncake | memcache | yuanrong.
+  backend: mooncake
+
+  # Decode does not write KV to the shared pool by default. Enable this
+  # only when the connector/model combination supports consumer writeback.
+  consumer_is_to_put: False
+
+  # Experimental Decode-KV writeback for cross-turn reuse. This takes
+  # effect only when consumer_is_to_put is also enabled.
+  store_decode_kv: False
+
+  # The current turn still loads from its paired Prefill through
+  # MooncakeConnectorV1. Leave Decode-side pool lookup disabled by default.
+  consumer_is_to_load: False
+
+  load_async: False
+
+  # Qwen3.5 hybrid KV groups use non-layerwise AscendStore transfers.
+  use_layerwise: False
+
+  # Forwarded unchanged to AscendStoreConnector for backend-specific options.
+  extra_config: {}
+
 # Prefill-Decode disaggregation.
 disaggregation:
 
@@ -510,33 +540,3 @@ disaggregation:
 
   # InfiniBand device (required for mooncake over RDMA).
   ib_device: null
-
-  # Shared external KV cache for vLLM-Ascend PD. This composes
-  # MooncakeConnectorV1 (current-turn P-to-D transfer) with
-  # AscendStoreConnector (cross-turn/cross-replica cache reuse).
-  cache_pool:
-
-    enabled: False
-
-    # AscendStore backend: mooncake | memcache | yuanrong.
-    backend: mooncake
-
-    # Decode does not write KV to the shared pool by default. Enable this
-    # only when the connector/model combination supports consumer writeback.
-    consumer_is_to_put: False
-
-    # Experimental Decode-KV writeback for cross-turn reuse. This takes
-    # effect only when consumer_is_to_put is also enabled.
-    store_decode_kv: False
-
-    # The current turn still loads from its paired Prefill through
-    # MooncakeConnectorV1. Leave Decode-side pool lookup disabled by default.
-    consumer_is_to_load: False
-
-    load_async: False
-
-    # Qwen3.5 hybrid KV groups use non-layerwise AscendStore transfers.
-    use_layerwise: False
-
-    # Forwarded unchanged to AscendStoreConnector for backend-specific options.
-    extra_config: {}

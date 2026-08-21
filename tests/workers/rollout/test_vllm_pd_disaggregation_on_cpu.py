@@ -52,9 +52,6 @@ def test_disaggregation_defaults_disabled_and_valid():
     assert cfg.transfer_backend == "nixl"
     assert cfg.bootstrap_port is None
     assert cfg.ib_device is None
-    assert cfg.cache_pool.enabled is False
-    assert cfg.cache_pool.consumer_is_to_put is False
-    assert cfg.cache_pool.store_decode_kv is False
 
 
 def test_disaggregation_enabled_nixl_accepted():
@@ -64,20 +61,20 @@ def test_disaggregation_enabled_nixl_accepted():
 
 
 def test_cache_pool_requires_mooncake_transport():
-    with pytest.raises(ValueError, match="cache_pool requires"):
-        DisaggregationConfig(
-            enabled=True,
-            transfer_backend="nixl",
+    with pytest.raises(ValueError, match="transfer_backend='mooncake'"):
+        RolloutConfig(
+            name="vllm",
             cache_pool=KVCachePoolConfig(enabled=True),
+            disaggregation=DisaggregationConfig(enabled=True, transfer_backend="nixl"),
         )
 
 
 def test_cache_pool_accepts_ascend_store_backends():
     for backend in ("mooncake", "memcache", "yuanrong"):
-        cfg = DisaggregationConfig(
-            enabled=True,
-            transfer_backend="mooncake",
+        cfg = RolloutConfig(
+            name="vllm",
             cache_pool={"enabled": True, "backend": backend},
+            disaggregation=DisaggregationConfig(enabled=True, transfer_backend="mooncake"),
         )
         assert isinstance(cfg.cache_pool, KVCachePoolConfig)
         assert cfg.cache_pool.backend == backend
@@ -193,16 +190,16 @@ def test_rollout_config_accepts_dict_disaggregation():
             "enabled": True,
             "decode_replicas": 3,
             "decode_policy": {"type": "power_of_two"},
-            "cache_pool": {"enabled": True, "backend": "mooncake"},
             "transfer_backend": "mooncake",
         },
+        cache_pool={"enabled": True, "backend": "mooncake"},
     )
     assert isinstance(cfg.disaggregation, DisaggregationConfig)
     assert cfg.disaggregation.decode_replicas == 3
     assert isinstance(cfg.disaggregation.decode_policy, RoutingPolicyConfig)
     assert cfg.disaggregation.decode_policy.type == "power_of_two"
-    assert isinstance(cfg.disaggregation.cache_pool, KVCachePoolConfig)
-    assert cfg.disaggregation.cache_pool.enabled is True
+    assert isinstance(cfg.cache_pool, KVCachePoolConfig)
+    assert cfg.cache_pool.enabled is True
 
 
 def test_rollout_config_accepts_dictconfig_disaggregation():

@@ -98,18 +98,18 @@ reward_model:
         compilation_config:
           cudagraph_mode: null
           cudagraph_capture_sizes: null
-      cache_pool:
-        enabled: false
-        backend: mooncake
-        consumer_is_to_put: false
-        store_decode_kv: false
-        consumer_is_to_load: false
-        load_async: false
-        use_layerwise: false
-        extra_config: {}
       transfer_backend: nixl
       bootstrap_port: null
       ib_device: null
+    cache_pool:
+      enabled: false
+      backend: mooncake
+      consumer_is_to_put: false
+      store_decode_kv: false
+      consumer_is_to_load: false
+      load_async: false
+      use_layerwise: false
+      extra_config: {}
 
 # Cloud/local sandbox fusion configuration for custom reward logic
 sandbox_fusion:

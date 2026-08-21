@@ -148,7 +148,7 @@ class vLLMPDReplica(vLLMReplica):
         )
         use_ascend_mooncake_v1 = is_torch_npu_available(check_device=False)
         transfer_backend = self.config.disaggregation.transfer_backend
-        cache_pool = self.config.disaggregation.cache_pool
+        cache_pool = self.config.cache_pool
         if cache_pool.enabled and not use_ascend_mooncake_v1:
             raise NotImplementedError(
                 "PD cache_pool currently requires vLLM-Ascend with MooncakeConnectorV1"
