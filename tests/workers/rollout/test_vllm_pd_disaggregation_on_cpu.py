@@ -322,6 +322,7 @@ def test_build_ascend_cache_pool_multiconnector(role, consumer_put):
     connectors = cfg["kv_connector_extra_config"]["connectors"]
     assert connectors[0]["kv_connector"] == "MooncakeConnectorV1"
     assert connectors[0]["kv_port"] == 20001
+    assert "engine_id" not in connectors[0]
     assert connectors[1]["kv_connector"] == "AscendStoreConnector"
     store_extra = connectors[1]["kv_connector_extra_config"]
     assert store_extra["backend"] == "mooncake"

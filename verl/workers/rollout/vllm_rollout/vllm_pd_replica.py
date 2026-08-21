@@ -428,6 +428,10 @@ class vLLMPDReplica(vLLMReplica):
             }
             if cache_pool_config and cache_pool_config.get("enabled", False):
                 mooncake_cfg = dict(cfg)
+                # MultiConnector propagates its parent engine_id to children.
+                # Keeping it here passes the keyword twice when vLLM builds
+                # the child KVTransferConfig.
+                mooncake_cfg.pop("engine_id", None)
                 store_extra = dict(cache_pool_config.get("extra_config", {}))
                 store_extra.update(
                     {
