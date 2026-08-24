@@ -13,6 +13,7 @@
 # limitations under the License.
 import logging
 import os
+import time
 
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer, register_trainer
 from verl.utils.debug import marked_timer
@@ -20,6 +21,14 @@ from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def _partial_rollout_debug_log(stage: str, **details) -> None:
+    enabled_values = {"1", "true", "yes", "on"}
+    if os.environ.get("PARTIAL_ROLLOUT_DEBUG_SYNC", "0").strip().lower() not in enabled_values:
+        return
+    detail_text = " ".join(f"{key}={value}" for key, value in details.items())
+    logger.warning("[PR_DEBUG] stage=%s time_ns=%s pid=%s %s", stage, time.time_ns(), os.getpid(), detail_text)
 
 
 @register_trainer("colocate_async")
@@ -48,12 +57,20 @@ class PPOTrainerColocateAsync(PPOTrainer):
     def on_step_end(self):
         with marked_timer("update_weights", self.timing_raw, color="red"):
             # wake up all replicas to update weights
+            _partial_rollout_debug_log("trainer_pre_update_weights", global_steps=self.global_steps)
             self.checkpoint_manager.update_weights(self.global_steps)
+            _partial_rollout_debug_log("trainer_post_update_weights", global_steps=self.global_steps)
             # resume generation
+            _partial_rollout_debug_log("trainer_pre_resume_generation", global_steps=self.global_steps)
             self.checkpoint_manager.resume_generation_replicas()
+            _partial_rollout_debug_log("trainer_post_resume_generation", global_steps=self.global_steps)
 
     def on_sample_end(self):
         # abort all unfinished requests and pause generation
+        _partial_rollout_debug_log("trainer_pre_abort_replicas", global_steps=self.global_steps)
         self.checkpoint_manager.abort_replicas()
+        _partial_rollout_debug_log("trainer_post_abort_replicas", global_steps=self.global_steps)
         # sleep all replicas to discard weights and kv cache
+        _partial_rollout_debug_log("trainer_pre_sleep_replicas", global_steps=self.global_steps)
         self.checkpoint_manager.sleep_replicas()
+        _partial_rollout_debug_log("trainer_post_sleep_replicas", global_steps=self.global_steps)

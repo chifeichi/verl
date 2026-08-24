@@ -18,6 +18,7 @@ import os
 import platform
 import signal
 import threading
+import time
 from collections.abc import Mapping
 from types import MethodType
 from typing import Any, Literal, Optional, get_args
@@ -40,6 +41,55 @@ VLLM_LORA_NAME = "123"
 VLLM_LORA_PATH = "simon_lora_path"
 
 VLLM_ASCEND_REQUIRED_ENV_VARS = {"VLLM_ALL2ALL_BACKEND": "flashinfer_all2allv", "VLLM_ASCEND_ENABLE_NZ": "0"}
+
+
+def _partial_rollout_debug_enabled() -> bool:
+    return os.environ.get("PARTIAL_ROLLOUT_DEBUG_SYNC", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _partial_rollout_debug_sync(stage: str, **details: Any) -> None:
+    """Opt-in NPU fence used to attribute asynchronous partial-rollout faults."""
+    if not _partial_rollout_debug_enabled():
+        return
+    detail_text = " ".join(f"{key}={value}" for key, value in details.items())
+    try:
+        device = torch.npu.current_device()
+    except Exception:
+        device = "unknown"
+    process_context = (
+        f"time_ns={time.time_ns()} pid={os.getpid()} device={device} "
+        f"rank={os.environ.get('RANK', 'unknown')} local_rank={os.environ.get('LOCAL_RANK', 'unknown')} "
+        f"replica_rank={os.environ.get('VERL_REPLICA_RANK', 'unknown')}"
+    )
+    logger.warning(
+        "[PR_DEBUG] stage=%s phase=before_sync %s %s",
+        stage,
+        process_context,
+        detail_text,
+    )
+    try:
+        torch.npu.synchronize()
+    except Exception:
+        logger.exception(
+            "[PR_DEBUG] stage=%s phase=sync_failed %s %s",
+            stage,
+            process_context,
+            detail_text,
+        )
+        raise
+    memory_text = ""
+    try:
+        free_bytes, total_bytes = torch.npu.mem_get_info(device)
+        memory_text = f" free_bytes={free_bytes} total_bytes={total_bytes}"
+    except Exception as exc:
+        memory_text = f" memory_info_error={type(exc).__name__}:{exc}"
+    logger.warning(
+        "[PR_DEBUG] stage=%s phase=sync_ok %s%s %s",
+        stage,
+        process_context,
+        memory_text,
+        detail_text,
+    )
 
 
 def _resolve_vllm_weight_sync_local_rank(worker_local_rank: int, parallel_config: Any) -> int:
@@ -238,6 +288,14 @@ class vLLMColocateWorkerExtension:
             # fall back to the worker's local rank on the current accelerator.
             self.device = torch.device(f"{get_device_name()}:{self.local_rank}")
 
+        _partial_rollout_debug_sync(
+            "weight_update_begin",
+            local_rank=self.local_rank,
+            target_device=self.device,
+            base_sync_done=base_sync_done,
+            use_shm=use_shm,
+        )
+
         # =========================== step 1: prepare for weight loading ===========================
         quant_reload_states = None
 
@@ -309,6 +367,12 @@ class vLLMColocateWorkerExtension:
 
         receiver.receive_weights(on_bucket_received=on_bucket_received)
 
+        _partial_rollout_debug_sync(
+            "weight_update_all_buckets_received",
+            local_rank=self.local_rank,
+            target_device=self.device,
+        )
+
         # =========================== step 3: process weights after loading ===========================
         if self._is_qat_model:
             # QAT (compressed-tensors): call process_weights_after_loading AFTER all buckets are received
@@ -335,6 +399,12 @@ class vLLMColocateWorkerExtension:
 
             for model, model_config in self._iter_all_models_with_config():
                 process_weights_after_loading(model, model_config, self.device)
+
+        _partial_rollout_debug_sync(
+            "weight_update_post_process",
+            local_rank=self.local_rank,
+            target_device=self.device,
+        )
 
     def _apply_buffer_updates_all_models(self, buffer_updates, main_named_buffers):
         """Apply buffer updates to the main model and any synced MTP drafter.
@@ -369,6 +439,19 @@ class vLLMColocateWorkerExtension:
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
         else:
             param_updates, buffer_updates, named_buffers = split_buffer_updates(self.model_runner.model, weights)
+            debug_bucket = getattr(self, "_partial_rollout_debug_bucket", 0) + 1
+            self._partial_rollout_debug_bucket = debug_bucket
+            update_bytes = sum(tensor.numel() * tensor.element_size() for _, tensor in weights)
+            first_names = ",".join(name for name, _ in weights[:3])
+            _partial_rollout_debug_sync(
+                "weight_bucket_pre_load",
+                bucket=debug_bucket,
+                updates=len(weights),
+                params=len(param_updates),
+                buffers=len(buffer_updates),
+                update_bytes=update_bytes,
+                first_names=first_names,
+            )
             # Add the FP8 related logic here as sharding manager has been deprecated.
             # Check if FP8 quantization is enabled and apply appropriate weight loading
             if is_fp8_model(self.model_runner.vllm_config):
@@ -391,7 +474,22 @@ class vLLMColocateWorkerExtension:
                             names = {n for n, _ in model.named_parameters(remove_duplicate=False)}
                             names.update(n for n, _ in model.named_buffers())
                             model.load_weights((resolve_weight_name(model, n, names), t) for n, t in param_updates)
+                _partial_rollout_debug_sync(
+                    "weight_bucket_post_param_load",
+                    bucket=debug_bucket,
+                    params=len(param_updates),
+                    buffers=len(buffer_updates),
+                    update_bytes=update_bytes,
+                )
                 loaded_buffers = self._apply_buffer_updates_all_models(buffer_updates, named_buffers)
+                _partial_rollout_debug_sync(
+                    "weight_bucket_post_buffer_load",
+                    bucket=debug_bucket,
+                    params=len(param_updates),
+                    buffers=len(buffer_updates),
+                    loaded_buffers=loaded_buffers,
+                    update_bytes=update_bytes,
+                )
                 logger.info(
                     f"Loading standard weights (non-FP8, async), "
                     f"loaded_params: {len(param_updates)}, loaded_buffers: {loaded_buffers}"
