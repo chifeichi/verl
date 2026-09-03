@@ -25,6 +25,8 @@ def test_disaggregation_defaults_disabled_and_valid():
     assert cfg.enabled is False
     assert cfg.prefill_replicas == 1
     assert cfg.decode_replicas == 1
+    assert cfg.prefill_data_parallel_size == 1
+    assert cfg.decode_data_parallel_size == 1
     assert cfg.transfer_backend == "nixl"
     assert cfg.bootstrap_port is None
     assert cfg.ib_device is None

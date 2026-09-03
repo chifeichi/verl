@@ -69,6 +69,8 @@ class DisaggregationConfig(BaseConfig):
     enabled: bool = False
     prefill_replicas: int = 1
     decode_replicas: int = 1
+    prefill_data_parallel_size: int = 1
+    decode_data_parallel_size: int = 1
     decode_tensor_model_parallel_size: Optional[int] = None
     prefill_gpu_memory_utilization: Optional[float] = None
     decode_gpu_memory_utilization: Optional[float] = None
@@ -91,6 +93,12 @@ class DisaggregationConfig(BaseConfig):
             raise ValueError(
                 f"disaggregation requires >=1 prefill and >=1 decode replica "
                 f"(got prefill_replicas={self.prefill_replicas}, decode_replicas={self.decode_replicas})"
+            )
+        if self.prefill_data_parallel_size < 1 or self.decode_data_parallel_size < 1:
+            raise ValueError(
+                "disaggregation role data parallel sizes must be >=1 "
+                f"(got prefill_data_parallel_size={self.prefill_data_parallel_size}, "
+                f"decode_data_parallel_size={self.decode_data_parallel_size})"
             )
         for role, value in (
             ("prefill", self.prefill_gpu_memory_utilization),

@@ -31,7 +31,7 @@ from typing import Any, Protocol
 
 from verl.workers.config.disaggregation import RoutingPolicyConfig
 
-__all__ = ["DecodePeerSelector"]
+__all__ = ["DecodePeerSelector", "DecodeRoutingController"]
 
 
 class _Sampler(Protocol):
@@ -360,3 +360,38 @@ class DecodePeerSelector:
         if self._cache_tree is not None:
             self._cache_tree = _TokenRadixTree(len(self.pending_requests))
             self._last_eviction = time.monotonic()
+
+
+class DecodeRoutingController:
+    """Replica-scoped decode routing state shared by every prefill engine.
+
+    A selector embedded in each prefill works for 1P:ND, but multiple prefills
+    would maintain independent round-robin cursors and in-flight counters.  In
+    particular, newly started prefills would all choose decode 0 first.  This
+    small Ray-actor-friendly controller makes selection and reservation atomic
+    across the complete prefill pool.
+    """
+
+    def __init__(
+        self,
+        policy_config: RoutingPolicyConfig | Mapping[str, Any],
+        peer_ids: Sequence[str],
+    ) -> None:
+        self._selector = DecodePeerSelector(policy_config=policy_config, peer_ids=peer_ids)
+
+    def acquire(self, *, routing_key: str | None = None, prompt_ids: Sequence[int] | None = None) -> int:
+        return self._selector.acquire(routing_key=routing_key, prompt_ids=prompt_ids)
+
+    def release(self, index: int) -> None:
+        self._selector.release(index)
+
+    def clear_cache(self) -> None:
+        self._selector.clear_cache()
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return routing counters for health checks and tests."""
+        return {
+            "peer_ids": list(self._selector.peer_ids),
+            "pending_requests": list(self._selector.pending_requests),
+            "policy": self._selector.config.type,
+        }

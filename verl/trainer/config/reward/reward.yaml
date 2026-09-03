@@ -79,6 +79,8 @@ reward_model:
       enabled: false
       prefill_replicas: 1
       decode_replicas: 1
+      prefill_data_parallel_size: 1
+      decode_data_parallel_size: 1
       decode_policy:
         type: round_robin
       decode_tensor_model_parallel_size: null
@@ -91,6 +93,7 @@ reward_model:
         max_num_batched_tokens: null
         max_num_seqs: null
       transfer_backend: nixl
+      mooncake_protocol: nvlink
       bootstrap_port: null
       ib_device: null
 

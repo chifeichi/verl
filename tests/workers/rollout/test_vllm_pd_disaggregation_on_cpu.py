@@ -20,8 +20,8 @@ Covers Phase 1 of the verl-vllm-pd-disagg series:
   * ``vLLMPDReplica`` config validation paths
   * GPU and Ascend connector selection/config shapes
 
-Phase 2 (NIXL 1P:1D smoke) and Phase 3 (1P:ND scaling) add live Ray-actor and
-vLLM-engine tests behind ``@pytest.mark.skipif(not CUDA_AVAILABLE)``.
+Live P:D and cross-node transport validation still requires Ray plus accelerator
+hardware; this module locks down the CPU-testable topology and dispatch logic.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ import pytest
 
 from verl.workers.config import DisaggregationConfig, RolloutConfig, RoutingPolicyConfig
 from verl.workers.rollout.vllm_rollout.pd_routing import DecodePeerSelector
+from verl.workers.rollout.vllm_rollout.pd_topology import plan_pd_engine_placements
 
 # ---------------------------------------------------------------------------
 # DisaggregationConfig validation
@@ -44,6 +45,8 @@ def test_disaggregation_defaults_disabled_and_valid():
     assert cfg.enabled is False
     assert cfg.prefill_replicas == 1
     assert cfg.decode_replicas == 1
+    assert cfg.prefill_data_parallel_size == 1
+    assert cfg.decode_data_parallel_size == 1
     assert cfg.transfer_backend == "nixl"
     assert cfg.bootstrap_port is None
     assert cfg.ib_device is None
@@ -89,6 +92,13 @@ def test_disaggregation_zero_replicas_rejected():
         DisaggregationConfig(enabled=True, prefill_replicas=0)
     with pytest.raises(ValueError, match="decode_replicas"):
         DisaggregationConfig(enabled=True, decode_replicas=0)
+
+
+def test_disaggregation_zero_role_data_parallel_size_rejected():
+    with pytest.raises(ValueError, match="data parallel sizes"):
+        DisaggregationConfig(enabled=True, prefill_data_parallel_size=0)
+    with pytest.raises(ValueError, match="data parallel sizes"):
+        DisaggregationConfig(enabled=True, decode_data_parallel_size=0)
 
 
 def test_disaggregation_bad_bootstrap_port_rejected():
@@ -207,7 +217,9 @@ def _build_kv_cfg(
     use_ascend_mooncake_v1: bool = False,
     kv_port=None,
     prefill_tp=None,
+    prefill_dp=1,
     decode_tp=None,
+    decode_dp=1,
 ):
     # Lazy import: only meaningful when vllm-rollout deps are importable.
     pytest.importorskip("vllm")
@@ -221,7 +233,9 @@ def _build_kv_cfg(
         use_ascend_mooncake_v1=use_ascend_mooncake_v1,
         kv_port=kv_port,
         prefill_tp=prefill_tp,
+        prefill_dp=prefill_dp,
         decode_tp=decode_tp,
+        decode_dp=decode_dp,
     )
 
 
@@ -306,6 +320,24 @@ def test_build_kv_transfer_config_ascend_mooncake_v1(role, expected_role):
     }
 
 
+def test_build_kv_transfer_config_ascend_mooncake_v1_role_dp_topology():
+    cfg = _build_kv_cfg(
+        role="prefill",
+        transfer_backend="mooncake",
+        use_ascend_mooncake_v1=True,
+        kv_port=19001,
+        prefill_tp=16,
+        prefill_dp=2,
+        decode_tp=16,
+        decode_dp=1,
+    )
+
+    assert cfg["kv_connector_extra_config"] == {
+        "prefill": {"dp_size": 2, "tp_size": 16},
+        "decode": {"dp_size": 1, "tp_size": 16},
+    }
+
+
 @pytest.mark.parametrize("protocol", ["nvlink", "local", "rdma", "tcp"])
 def test_disagg_config_accepts_known_mooncake_protocols(protocol):
     DisaggregationConfig(enabled=True, transfer_backend="mooncake", mooncake_protocol=protocol)
@@ -337,12 +369,15 @@ def _make_pd_config(**overrides) -> RolloutConfig:
         enabled=overrides.pop("enabled", True),
         prefill_replicas=overrides.pop("prefill_replicas", 1),
         decode_replicas=overrides.pop("decode_replicas", 1),
+        prefill_data_parallel_size=overrides.pop("prefill_data_parallel_size", 1),
+        decode_data_parallel_size=overrides.pop("decode_data_parallel_size", 1),
         transfer_backend=overrides.pop("transfer_backend", "nixl"),
         decode_tensor_model_parallel_size=overrides.pop("decode_tensor_model_parallel_size", None),
         prefill_gpu_memory_utilization=overrides.pop("prefill_gpu_memory_utilization", None),
         decode_gpu_memory_utilization=overrides.pop("decode_gpu_memory_utilization", None),
         prefill_engine_kwargs=overrides.pop("prefill_engine_kwargs", {}),
         decode_engine_kwargs=overrides.pop("decode_engine_kwargs", {}),
+        bootstrap_port=overrides.pop("bootstrap_port", None),
         ib_device=overrides.pop("ib_device", None),
     )
     return RolloutConfig(
@@ -396,6 +431,8 @@ def test_pd_replica_init_happy_path_1p1d(patched_replica_cls):
     assert replica._n_decode == 1
     assert replica._prefill_tp == 1
     assert replica._decode_tp == 1
+    assert replica._prefill_dp == 1
+    assert replica._decode_dp == 1
     assert replica.world_size == 2  # 1 prefill + 1 decode
     assert replica._prefill_servers == [] and replica._decode_servers == []
 
@@ -444,16 +481,96 @@ def test_pd_replica_init_rejects_unsupported_backend(patched_replica_cls):
         patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
 
 
-def test_pd_replica_init_rejects_multi_prefill(patched_replica_cls):
-    cfg = _make_pd_config(prefill_replicas=2)
-    with pytest.raises(NotImplementedError, match="prefill_replicas=1"):
+def test_pd_replica_init_accepts_multi_prefill(patched_replica_cls):
+    cfg = _make_pd_config(prefill_replicas=2, decode_replicas=2)
+    replica = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+
+    assert replica._n_prefill == 2
+    assert replica._n_decode == 2
+    assert replica.world_size == 4
+
+
+def test_pd_replica_init_rejects_partially_filled_last_node(patched_replica_cls):
+    cfg = _make_pd_config(decode_replicas=8)  # 1 + 8 = 9 devices over 8-device nodes
+    with pytest.raises(ValueError, match="must fill whole"):
         patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
 
 
-def test_pd_replica_init_rejects_oversized_world(patched_replica_cls):
-    cfg = _make_pd_config(decode_replicas=8)  # 1 + 8 = 9 GPUs needed
-    with pytest.raises(NotImplementedError, match="single-node only"):
+def test_pd_replica_init_accepts_multi_node_pool(patched_replica_cls):
+    cfg = _make_pd_config(
+        prefill_replicas=2,
+        decode_replicas=2,
+        tensor_model_parallel_size=4,
+        decode_tensor_model_parallel_size=4,
+    )
+    replica = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+
+    assert replica.world_size == 16
+    assert replica.gpus_per_replica_node == 8
+    assert replica.nnodes == 2
+
+
+def test_pd_replica_init_accepts_single_prefill_spanning_nodes_by_dp(patched_replica_cls):
+    cfg = _make_pd_config(
+        prefill_replicas=1,
+        prefill_data_parallel_size=2,
+        decode_replicas=2,
+        decode_data_parallel_size=1,
+        tensor_model_parallel_size=16,
+        decode_tensor_model_parallel_size=16,
+    )
+    replica = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=16)
+
+    # P0 = TP16 x DP2 = 32 devices; D0/D1 = TP16 x DP1 each.
+    assert replica.world_size == 64
+    assert replica.nnodes == 4
+    assert replica._prefill_dp == 2
+    assert replica._decode_dp == 1
+
+
+def test_pd_replica_init_allows_engine_tp_larger_than_node_when_dp_is_one(patched_replica_cls):
+    cfg = _make_pd_config(
+        tensor_model_parallel_size=16,
+        decode_tensor_model_parallel_size=16,
+    )
+    replica = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+
+    assert replica.world_size == 32
+    assert replica.nnodes == 4
+
+
+def test_pd_replica_init_rejects_cross_node_tp_combined_with_role_dp(patched_replica_cls):
+    cfg = _make_pd_config(
+        tensor_model_parallel_size=16,
+        prefill_data_parallel_size=2,
+        decode_tensor_model_parallel_size=8,
+    )
+    with pytest.raises(NotImplementedError, match="cannot combine cross-node TP"):
         patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+
+
+def test_pd_replica_assigns_non_overlapping_explicit_ports(patched_replica_cls):
+    cfg = _make_pd_config(prefill_replicas=2, decode_replicas=2, bootstrap_port=19000)
+    replica0 = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+    replica1 = patched_replica_cls(replica_rank=1, config=cfg, model_config=None, gpus_per_node=8)
+
+    assert [replica0._requested_port(i) for i in range(4)] == [19000, 19001, 19002, 19003]
+    assert [replica1._requested_port(i) for i in range(4)] == [19004, 19005, 19006, 19007]
+
+
+def test_pd_replica_reserves_full_multi_node_engine_port_ranges(patched_replica_cls):
+    cfg = _make_pd_config(
+        prefill_replicas=1,
+        prefill_data_parallel_size=2,
+        decode_replicas=2,
+        tensor_model_parallel_size=16,
+        decode_tensor_model_parallel_size=16,
+        bootstrap_port=19000,
+    )
+    replica = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=16)
+
+    # P0 owns [19000, 19031], then D0 and D1 get disjoint 16-port ranges.
+    assert [replica._requested_port(i) for i in range(3)] == [19000, 19032, 19048]
 
 
 def test_pd_role_engine_kwargs_deep_merge_without_cross_role_mutation(patched_replica_cls):
@@ -466,33 +583,166 @@ def test_pd_role_engine_kwargs_deep_merge_without_cross_role_mutation(patched_re
     )
     replica = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
 
-    prefill = replica._build_pd_role_config("prefill", tp=1)
-    decode = replica._build_pd_role_config("decode", tp=1)
+    prefill = replica._build_pd_role_config("prefill", tp=1, dp=2)
+    decode = replica._build_pd_role_config("decode", tp=1, dp=3)
 
     assert prefill.gpu_memory_utilization == 0.85
     assert decode.gpu_memory_utilization == 0.7
+    assert prefill.data_parallel_size == 2
+    assert decode.data_parallel_size == 3
     assert prefill.engine_kwargs["vllm"] == {"max_num_batched_tokens": 65536, "max_num_seqs": 512}
     assert decode.engine_kwargs["vllm"] == {"max_num_batched_tokens": 2048, "max_num_seqs": 256}
     assert cfg.engine_kwargs["vllm"] == {"max_num_seqs": 512}
 
 
-def test_pd_replica_exposes_prefill_request_and_all_metrics_endpoints(patched_replica_cls):
-    cfg = _make_pd_config(decode_replicas=2)
+def test_pd_replica_exposes_all_prefill_request_and_metrics_endpoints(patched_replica_cls):
+    cfg = _make_pd_config(prefill_replicas=2, decode_replicas=2)
     replica = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
-    prefill_handles = [object()]
+    prefill_handles = [object(), object()]
     replica._prefill_servers = prefill_handles
     replica._decode_servers = [object(), object()]
-    replica._prefill_server_addresses = ["p0:8000"]
+    replica._prefill_server_addresses = ["p0:8000", "p1:8000"]
     replica._decode_server_addresses = ["d0:8000", "d1:8000"]
 
     assert replica.get_request_server_endpoints() == [
         ("p0:8000", prefill_handles[0]),
+        ("p1:8000", prefill_handles[1]),
     ]
     assert [labels["pd_role"] for _, labels in replica.get_metrics_server_endpoints()] == [
+        "prefill",
         "prefill",
         "decode",
         "decode",
     ]
+
+
+def test_plan_pd_engines_allows_p_and_d_on_different_nodes():
+    worker_infos = [
+        ("node-a", "0", "10.0.0.1"),
+        ("node-a", "1", "10.0.0.1"),
+        ("node-a", "2", "10.0.0.1"),
+        ("node-a", "3", "10.0.0.1"),
+        ("node-b", "0", "10.0.0.2"),
+        ("node-b", "1", "10.0.0.2"),
+        ("node-b", "2", "10.0.0.2"),
+        ("node-b", "3", "10.0.0.2"),
+    ]
+
+    prefills, decodes = plan_pd_engine_placements(
+        worker_infos,
+        prefill_replicas=2,
+        prefill_tp=2,
+        prefill_dp=1,
+        decode_replicas=2,
+        decode_tp=2,
+        decode_dp=1,
+        gpus_per_node=4,
+    )
+
+    assert [(p.role, p.index, p.head.node_id, p.worker_start, p.worker_end) for p in prefills] == [
+        ("prefill", 0, "node-a", 0, 2),
+        ("prefill", 1, "node-a", 2, 4),
+    ]
+    assert [(p.role, p.index, p.head.node_id, p.worker_start, p.worker_end) for p in decodes] == [
+        ("decode", 0, "node-b", 4, 6),
+        ("decode", 1, "node-b", 6, 8),
+    ]
+
+
+def test_plan_pd_engine_spans_two_nodes_by_data_parallelism():
+    worker_infos = [
+        *(("node-a", str(i), "10.0.0.1") for i in range(4)),
+        *(("node-b", str(i), "10.0.0.2") for i in range(4)),
+        *(("node-c", str(i), "10.0.0.3") for i in range(4)),
+    ]
+
+    prefills, decodes = plan_pd_engine_placements(
+        worker_infos,
+        prefill_replicas=1,
+        prefill_tp=2,
+        prefill_dp=4,
+        decode_replicas=1,
+        decode_tp=2,
+        decode_dp=2,
+        gpus_per_node=4,
+    )
+
+    assert len(prefills) == 1
+    assert prefills[0].world_size == 8
+    assert [node.node_id for node in prefills[0].nodes] == ["node-a", "node-b"]
+    assert [node.node_rank for node in prefills[0].nodes] == [0, 1]
+    assert decodes[0].world_size == 4
+    assert [node.node_id for node in decodes[0].nodes] == ["node-c"]
+
+
+def test_plan_prefill_and_decode_engines_span_nodes_by_tensor_parallelism():
+    worker_infos = [
+        *(("node-a", str(i), "10.0.0.1") for i in range(4)),
+        *(("node-b", str(i), "10.0.0.2") for i in range(4)),
+        *(("node-c", str(i), "10.0.0.3") for i in range(4)),
+        *(("node-d", str(i), "10.0.0.4") for i in range(4)),
+    ]
+
+    prefills, decodes = plan_pd_engine_placements(
+        worker_infos,
+        prefill_replicas=1,
+        prefill_tp=8,
+        prefill_dp=1,
+        decode_replicas=1,
+        decode_tp=8,
+        decode_dp=1,
+        gpus_per_node=4,
+    )
+
+    assert [node.node_id for node in prefills[0].nodes] == ["node-a", "node-b"]
+    assert [node.node_id for node in decodes[0].nodes] == ["node-c", "node-d"]
+
+
+def test_plan_single_decode_engine_spans_two_nodes_by_data_parallelism():
+    worker_infos = [
+        *(("node-a", str(i), "10.0.0.1") for i in range(4)),
+        *(("node-b", str(i), "10.0.0.2") for i in range(4)),
+        *(("node-c", str(i), "10.0.0.3") for i in range(4)),
+    ]
+
+    prefills, decodes = plan_pd_engine_placements(
+        worker_infos,
+        prefill_replicas=1,
+        prefill_tp=2,
+        prefill_dp=2,
+        decode_replicas=1,
+        decode_tp=2,
+        decode_dp=4,
+        gpus_per_node=4,
+    )
+
+    assert prefills[0].world_size == 4
+    assert [node.node_id for node in prefills[0].nodes] == ["node-a"]
+    assert len(decodes) == 1
+    assert decodes[0].world_size == 8
+    assert [node.node_id for node in decodes[0].nodes] == ["node-b", "node-c"]
+    assert [node.node_rank for node in decodes[0].nodes] == [0, 1]
+
+
+def test_plan_pd_engines_rejects_tp_group_crossing_node_boundary():
+    worker_infos = [
+        ("node-a", "0", "10.0.0.1"),
+        ("node-b", "0", "10.0.0.2"),
+        ("node-b", "1", "10.0.0.2"),
+        ("node-b", "2", "10.0.0.2"),
+    ]
+
+    with pytest.raises(ValueError, match="span multiple physical nodes"):
+        plan_pd_engine_placements(
+            worker_infos,
+            prefill_replicas=1,
+            prefill_tp=2,
+            prefill_dp=1,
+            decode_replicas=1,
+            decode_tp=2,
+            decode_dp=1,
+            gpus_per_node=2,
+        )
 
 
 class _AwaitableRemoteMethod:
@@ -563,6 +813,7 @@ class _DispatchStub:
         self._pd_decode_peers = list(decode_peers)
         peer_ids = [f"http://decode-{index}:8000" for index in range(len(self._pd_decode_peers))]
         self._pd_decode_selector = DecodePeerSelector(RoutingPolicyConfig(type=policy), peer_ids)
+        self._pd_decode_router = None
         # Used by _pd_dispatch to branch between NIXL (read kv_transfer_params
         # back from prefill) and Mooncake (construct it locally from prefill
         # engine_id + bootstrap addr).
@@ -578,6 +829,16 @@ class _DispatchStub:
         from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
         return vLLMHttpServer._select_decode_peer(self, routing_key, prompt_ids)
+
+    async def _acquire_decode_peer(self, routing_key, prompt_ids):
+        from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
+
+        return await vLLMHttpServer._acquire_decode_peer(self, routing_key, prompt_ids)
+
+    async def _release_decode_peer(self, index):
+        from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
+
+        await vLLMHttpServer._release_decode_peer(self, index)
 
 
 def _import_http_server():
@@ -732,6 +993,34 @@ async def test_pd_dispatch_mooncake_constructs_decode_kv_params_locally():
     assert dkv["remote_bootstrap_addr"] == f"http://127.0.0.1:{stub._pd_prefill_side_channel_port}"
     # transfer_id must match across legs so prefill and decode rendezvous.
     assert dkv["transfer_id"] == transfer_id
+
+
+@pytest.mark.asyncio
+async def test_pd_dispatch_mooncake_uses_cross_node_prefill_address():
+    from unittest.mock import MagicMock
+
+    server_cls = _import_http_server()
+    decode_peer = MagicMock()
+    decode_peer.generate.remote = MagicMock(return_value=_make_awaitable_token_output([7]))
+
+    async def fake_generate(prompt_ids, sampling_params, request_id, **kw):
+        from verl.workers.rollout.replica import TokenOutput
+
+        return TokenOutput(token_ids=[42], stop_reason="completed", extra_fields={})
+
+    stub = _DispatchStub(decode_peers=[decode_peer], connector="MooncakeConnector")
+    stub._pd_prefill_side_channel_host = "10.20.30.40"
+    stub.generate = fake_generate
+
+    await server_cls._pd_dispatch(
+        stub,
+        prompt_ids=[1, 2],
+        sampling_params={"max_tokens": 16},
+        request_id="req-cross-node",
+    )
+
+    decode_kv = decode_peer.generate.remote.call_args.kwargs["kv_transfer_params"]
+    assert decode_kv["remote_bootstrap_addr"] == "http://10.20.30.40:5559"
 
 
 @pytest.mark.asyncio

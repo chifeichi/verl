@@ -483,11 +483,19 @@ disaggregation:
   # Master switch for PD disaggregation.
   enabled: False
 
-  # Number of prefill replicas (each uses tensor_model_parallel_size GPUs).
+  # Number of prefill replicas (each uses prefill TP x prefill DP devices).
+  # All prefills are exposed to the global request load balancer.
   prefill_replicas: 1
 
-  # Number of decode replicas.
+  # Number of decode replicas (each uses decode TP x decode DP devices),
+  # shared by all prefills in this PD replica.
   decode_replicas: 1
+
+  # DP size inside one logical P/D instance. A logical instance may span nodes
+  # either with TP > n_gpus_per_node (DP must remain 1), or with node-local TP
+  # and role DP > the number of local DP ranks.
+  prefill_data_parallel_size: 1
+  decode_data_parallel_size: 1
 
   # P-to-D routing policy. round_robin preserves the original Verl behavior.
   # Other supported values: random, power_of_two, consistent_hash,
@@ -513,7 +521,12 @@ disaggregation:
   # KV cache transport: nixl | mooncake | ascend | mori | fake.
   transfer_backend: nixl
 
-  # Bootstrap server port on prefill side; null = auto-assign.
+  # Mooncake transport. Cross-node GPU PD requires rdma or tcp; Ascend's
+  # MooncakeConnectorV1 selects its own Ascend transport path.
+  mooncake_protocol: nvlink
+
+  # Base side-channel port; null = auto-assign on each physical node. When
+  # set, consecutive ports are reserved for every P/D engine and replica.
   bootstrap_port: null
 
   # InfiniBand device (required for mooncake over RDMA).

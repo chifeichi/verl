@@ -128,8 +128,10 @@ class vLLMHttpServer:
         # Filled by vLLMPDReplica.set_pd_peer for prefill-side routing.
         self._pd_decode_peers: list[ActorHandle] = []
         self._pd_prefill_side_channel_port: Optional[int] = None
+        self._pd_prefill_side_channel_host: Optional[str] = None
         self._pd_prefill_engine_id: Optional[str] = None
         self._pd_decode_selector: Optional[DecodePeerSelector] = None
+        self._pd_decode_router: Optional[ActorHandle] = None
 
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
         os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
@@ -246,8 +248,10 @@ class vLLMHttpServer:
     async def set_pd_peer(
         self,
         decode_peers: list,
+        prefill_side_channel_host: str,
         prefill_side_channel_port: int,
         prefill_engine_id: str,
+        decode_router: Optional[ActorHandle] = None,
     ) -> None:
         assert self._disaggregation_role == "prefill", (
             f"set_pd_peer must be called on the prefill server (got role={self._disaggregation_role!r})"
@@ -261,12 +265,17 @@ class vLLMHttpServer:
             f"http://[{host}]:{port}" if is_valid_ipv6_address(host) else f"http://{host}:{port}"
             for host, port in decode_addresses
         ]
+        self._pd_prefill_side_channel_host = prefill_side_channel_host
         self._pd_prefill_side_channel_port = prefill_side_channel_port
         self._pd_prefill_engine_id = prefill_engine_id
-        self._pd_decode_selector = DecodePeerSelector(
-            policy_config=self.config.disaggregation.decode_policy,
-            peer_ids=decode_peer_ids,
-        )
+        self._pd_decode_router = decode_router
+        if decode_router is None:
+            # Backward-compatible fallback for direct server construction and
+            # lightweight tests. vLLMPDReplica always installs a shared router.
+            self._pd_decode_selector = DecodePeerSelector(
+                policy_config=self.config.disaggregation.decode_policy,
+                peer_ids=decode_peer_ids,
+            )
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
         if self.node_rank != 0:
@@ -747,6 +756,34 @@ class vLLMHttpServer:
         index = self._pd_decode_selector.acquire(routing_key=routing_key, prompt_ids=prompt_ids)
         return index, self._pd_decode_peers[index]
 
+    async def _acquire_decode_peer(self, routing_key: str, prompt_ids: Sequence[int]) -> tuple[int, ActorHandle]:
+        if self._pd_decode_router is not None:
+            # Avoid copying a potentially 1M-token prompt through Ray unless
+            # the selected policy actually indexes token prefixes.
+            router_prompt_ids = (
+                prompt_ids if self.config.disaggregation.decode_policy.type == "cache_aware" else None
+            )
+            index = await self._pd_decode_router.acquire.remote(
+                routing_key=routing_key,
+                prompt_ids=router_prompt_ids,
+            )
+            return index, self._pd_decode_peers[index]
+        return self._select_decode_peer(routing_key, prompt_ids)
+
+    async def _release_decode_peer(self, index: int) -> None:
+        if self._pd_decode_router is not None:
+            await self._pd_decode_router.release.remote(index)
+            return
+        if self._pd_decode_selector is None:
+            raise RuntimeError("decode peer selector is not initialized")
+        self._pd_decode_selector.release(index)
+
+    async def _clear_pd_decode_cache(self) -> None:
+        if self._pd_decode_router is not None:
+            await self._pd_decode_router.clear_cache.remote()
+        elif self._pd_decode_selector is not None:
+            self._pd_decode_selector.clear_cache()
+
     async def _pd_dispatch(
         self,
         prompt_ids: list[int],
@@ -761,8 +798,7 @@ class vLLMHttpServer:
     ) -> TokenOutput:
         """Reserve a decode peer, run prefill locally, then dispatch decode."""
         effective_routing_key = routing_key or request_id
-        decode_peer_index, decode_peer = self._select_decode_peer(effective_routing_key, prompt_ids)
-        assert self._pd_decode_selector is not None
+        decode_peer_index, decode_peer = await self._acquire_decode_peer(effective_routing_key, prompt_ids)
         try:
             connector = (self._disaggregation_kv_transfer_config or {}).get("kv_connector", "")
             is_mooncake = connector == "MooncakeConnector"
@@ -790,11 +826,18 @@ class vLLMHttpServer:
                 kv_transfer_params=prefill_kv_params,
             )
             if is_mooncake:
+                if self._pd_prefill_side_channel_host is None or self._pd_prefill_side_channel_port is None:
+                    raise RuntimeError("prefill side-channel endpoint is not initialized")
+                prefill_host = (
+                    f"[{self._pd_prefill_side_channel_host}]"
+                    if is_valid_ipv6_address(self._pd_prefill_side_channel_host)
+                    else self._pd_prefill_side_channel_host
+                )
                 decode_kv_params = {
                     "do_remote_decode": False,
                     "do_remote_prefill": True,
                     "remote_engine_id": self._pd_prefill_engine_id,
-                    "remote_bootstrap_addr": f"http://127.0.0.1:{self._pd_prefill_side_channel_port}",
+                    "remote_bootstrap_addr": f"http://{prefill_host}:{self._pd_prefill_side_channel_port}",
                     "transfer_id": transfer_id,
                 }
             else:
@@ -814,7 +857,7 @@ class vLLMHttpServer:
                 kv_transfer_params=decode_kv_params,
             )
         finally:
-            self._pd_decode_selector.release(decode_peer_index)
+            await self._release_decode_peer(decode_peer_index)
 
     async def wake_up(self, tags: list[str] | None = None):
         if self.node_rank != 0:
@@ -839,8 +882,8 @@ class vLLMHttpServer:
             cache_invalidated = True
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip wake_up in standalone mode")
-        if cache_invalidated and self._pd_decode_selector is not None:
-            self._pd_decode_selector.clear_cache()
+        if cache_invalidated:
+            await self._clear_pd_decode_cache()
 
     async def sleep(self):
         if self.node_rank != 0 or not self.config.free_cache_engine:
@@ -855,8 +898,8 @@ class vLLMHttpServer:
             cache_invalidated = True
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
-        if cache_invalidated and self._pd_decode_selector is not None:
-            self._pd_decode_selector.clear_cache()
+        if cache_invalidated:
+            await self._clear_pd_decode_cache()
 
     async def clear_kv_cache(self):
         if self.node_rank == 0:
@@ -868,8 +911,7 @@ class vLLMHttpServer:
 
             await self.engine.reset_mm_cache()
             await self.engine.reset_encoder_cache()
-            if self._pd_decode_selector is not None:
-                self._pd_decode_selector.clear_cache()
+            await self._clear_pd_decode_cache()
 
     async def release_kv_cache(self):
         """Free the kv_cache pool for the duration of a weight sync."""

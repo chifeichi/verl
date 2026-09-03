@@ -556,7 +556,10 @@ class LLMServerManager:
                 else prefill_tp
             )
             rollout_world_size = (
-                (prefill_tp * disagg.prefill_replicas + decode_tp * disagg.decode_replicas)
+                (
+                    prefill_tp * disagg.prefill_data_parallel_size * disagg.prefill_replicas
+                    + decode_tp * disagg.decode_data_parallel_size * disagg.decode_replicas
+                )
                 * self.rollout_config.data_parallel_size
                 * self.rollout_config.pipeline_model_parallel_size
             )

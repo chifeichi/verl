@@ -15,7 +15,7 @@
 import pytest
 
 from verl.workers.config import RoutingPolicyConfig
-from verl.workers.rollout.vllm_rollout.pd_routing import DecodePeerSelector
+from verl.workers.rollout.vllm_rollout.pd_routing import DecodePeerSelector, DecodeRoutingController
 
 
 class _FixedSampler:
@@ -84,6 +84,21 @@ def test_decode_selector_release_and_empty_eligible_guard():
         selector.select(eligible=[])
     with pytest.raises(RuntimeError, match="no in-flight"):
         selector.release(0)
+
+
+def test_shared_controller_coordinates_multiple_prefills():
+    controller = DecodeRoutingController(RoutingPolicyConfig(type="round_robin"), ["d0", "d1"])
+
+    # These acquisitions represent calls from two different P actors. A
+    # per-P selector would choose d0 twice; the shared controller rotates.
+    first = controller.acquire(routing_key="p0-request")
+    second = controller.acquire(routing_key="p1-request")
+
+    assert (first, second) == (0, 1)
+    assert controller.snapshot()["pending_requests"] == [1, 1]
+    controller.release(first)
+    controller.release(second)
+    assert controller.snapshot()["pending_requests"] == [0, 0]
 
 
 def test_consistent_hash_keeps_session_on_same_peer():

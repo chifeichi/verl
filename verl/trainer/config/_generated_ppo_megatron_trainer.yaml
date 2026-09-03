@@ -439,6 +439,8 @@ actor_rollout_ref:
       enabled: false
       prefill_replicas: 1
       decode_replicas: 1
+      prefill_data_parallel_size: 1
+      decode_data_parallel_size: 1
       decode_policy:
         type: round_robin
       decode_tensor_model_parallel_size: null
@@ -451,6 +453,7 @@ actor_rollout_ref:
         max_num_batched_tokens: null
         max_num_seqs: null
       transfer_backend: nixl
+      mooncake_protocol: nvlink
       bootstrap_port: null
       ib_device: null
   model:
@@ -879,6 +882,8 @@ reward:
         enabled: false
         prefill_replicas: 1
         decode_replicas: 1
+        prefill_data_parallel_size: 1
+        decode_data_parallel_size: 1
         decode_policy:
           type: round_robin
         decode_tensor_model_parallel_size: null
@@ -891,6 +896,7 @@ reward:
           max_num_batched_tokens: null
           max_num_seqs: null
         transfer_backend: nixl
+        mooncake_protocol: nvlink
         bootstrap_port: null
         ib_device: null
   sandbox_fusion:
